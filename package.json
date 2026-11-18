@@ -1,0 +1,12 @@
+{
+  "name": "maestro",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Maestro prototype: marketing spend analysis, re-forecasting and campaign management (synthetic data)",
+  "type": "module",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "reset": "node --disable-warning=ExperimentalWarning db.js --reset"
+  }
+}
