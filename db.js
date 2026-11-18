@@ -9,11 +9,32 @@ const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data');
 const FILE = path.join(DIR, 'maestro.db');
 
 export const YEAR = 2026;
-export const MONTHS = Array.from({ length: 12 }, (_, i) => `${YEAR}-${String(i + 1).padStart(2, '0')}`);
+export const YEARS = [YEAR, YEAR + 1];
+export const MONTHS = YEARS.flatMap((y) => Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`));
+export const FX_CAD_USD = 0.70; // one Canadian dollar in US dollars, used wherever the app translates between the two
+// Entity hierarchy: Division → Region → Brand → Market location. Division follows from the region.
+export const REGIONS = ['Midwest', 'Northeast', 'Mid-Atlantic', 'Southeast', 'Northwest', 'Canada'];
+export const divisionOf = (region) => (region === 'Canada' ? 'Canada' : 'US');
+// Starting assignment by where each brand operates. Editable on the Mappings screen; anything not listed starts Unassigned.
+const REGION_GUESS = {
+  Midwest: ['infinity exteriors', 'overhead solutions', 'premier roofing', 'werner', 'parkhill roofing', 'exterior heroes'],
+  Northeast: ['couto construction', 'henderson roofing', 'gf sprague', 'franzoso contracting', 'high point roofing', 'g. fedale'],
+  'Mid-Atlantic': ['american home contractors', 'exterior medics', 'cochran exteriors', 'resnick roofing'],
+  Southeast: ['watkins construction', 'altec roofing', "carpenter's roofing & sheet metal", 'skywalker roofing'],
+  Northwest: ['valentine roofing', 'interstate roofing', 'specialty home'],
+  Canada: ["d'angelo and sons", 'wheatland roofing'],
+};
+export function assignRegions(db) {
+  for (const b of db.prepare('SELECT id, name FROM brand WHERE region IS NULL').all()) {
+    const k = b.name.toLowerCase().replace(/[`’]/g, "'").trim();
+    const region = Object.keys(REGION_GUESS).find((r) => REGION_GUESS[r].includes(k)) || 'Unassigned';
+    db.prepare('UPDATE brand SET region = ? WHERE id = ?').run(region, b.id);
+  }
+}
 export const CLOSED_THROUGH = `${YEAR}-10`; // last month with posted actuals
 
 const SCHEMA = `
-CREATE TABLE brand (id INTEGER PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL);
+CREATE TABLE brand (id INTEGER PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', region TEXT); -- currency the brand's amounts are stored in
 CREATE TABLE location (id INTEGER PRIMARY KEY, brand_id INTEGER NOT NULL REFERENCES brand(id), name TEXT NOT NULL);
 CREATE TABLE channel (id INTEGER PRIMARY KEY, name TEXT NOT NULL, sort INTEGER NOT NULL);
 CREATE TABLE level1 (id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL REFERENCES channel(id), name TEXT NOT NULL, gl_account TEXT);
@@ -27,6 +48,7 @@ CREATE TABLE campaign (
   start_month TEXT, end_month TEXT,
   monthly_spend REAL DEFAULT 0, exp_appts REAL DEFAULT 0, exp_bookings REAL DEFAULT 0,
   location_ids TEXT, landing_url TEXT, tracking_url TEXT, tracking_phone TEXT,
+  linked_to INTEGER,                              -- CRM campaign that this ad-platform campaign's spend belongs to
   created_by TEXT, created_at TEXT, decided_by TEXT, decided_at TEXT, decision_note TEXT, crm_pushed_at TEXT
 );
 CREATE TABLE spend (
@@ -57,6 +79,12 @@ CREATE TABLE gl (
 );
 CREATE TABLE gl_map (account TEXT NOT NULL, level1_id INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (account, level1_id)); -- GL account → Level 1 choices
 CREATE TABLE entity (code TEXT PRIMARY KEY, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL); -- Vena / Acumatica branch
+CREATE TABLE channel_plan (
+  month TEXT NOT NULL, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+  budget REAL NOT NULL DEFAULT 0,   -- annual budget from Vena, fixed
+  forecast REAL,                    -- channel re-forecast for an open month; NULL means "not re-forecast, use budget"
+  PRIMARY KEY (month, location_id, channel_id)
+);
 CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, user TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
 `;
@@ -143,15 +171,15 @@ function seed(db) {
 
     for (const [name, l1, vendor, source, base, cpl, apptRate, closeRate, ticket, drift, active, fixedLeads] of TEMPLATES) {
       const cid = ins(`INSERT INTO campaign (brand_id, level1_id, name, vendor, source, status, start_month, end_month, created_by, created_at)
-                       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, 'seed', ?)`).run(bid, level1Id[l1], name, vendor, source, MONTHS[0], MONTHS[11], `${YEAR}-01-02`).lastInsertRowid;
+                       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, 'seed', ?)`).run(bid, level1Id[l1], name, vendor, source, MONTHS[0], MONTHS.at(-1), `${YEAR}-01-02`).lastInsertRowid;
       const primary = insName.run(bid, name, cid, 'mapped', `${YEAR}-01-02`).lastInsertRowid;
       const variants = (VARIANTS[name] || []).filter(() => r() > 0.25).map((v) => insName.run(bid, v, null, 'open', `${YEAR}-0${1 + Math.floor(r() * 8)}-1${Math.floor(r() * 9)}`).lastInsertRowid);
 
       for (const loc of locRows) {
         MONTHS.forEach((m, i) => {
-          const on = !active || active.includes(i + 1);
+          const on = !active || active.includes((i % 12) + 1);
           const closed = m <= CLOSED_THROUGH;
-          const budget = on ? Math.round((base * SEASON[i] * loc.scale) / 10) * 10 : 0;
+          const budget = on ? Math.round((base * SEASON[i % 12] * loc.scale) / 10) * 10 : 0;
           const actual = closed ? Math.round(budget * drift * (0.88 + r() * 0.24)) : 0;
           const projected = closed ? actual : Math.round((budget * drift) / 10) * 10;
           if (budget || actual) insSpend.run(cid, loc.id, m, budget, actual, projected);
@@ -162,7 +190,7 @@ function seed(db) {
             gl[k] = (gl[k] || 0) + actual * timing * extra;
           }
           if (!closed) return;
-          const leads = fixedLeads ? Math.round(fixedLeads * SEASON[i] * loc.scale) : cpl ? Math.floor((actual / cpl) * (0.85 + r() * 0.3) + r()) : 0;
+          const leads = fixedLeads ? Math.round(fixedLeads * SEASON[i % 12] * loc.scale) : cpl ? Math.floor((actual / cpl) * (0.85 + r() * 0.3) + r()) : 0;
           if (!leads) return;
           const appts = Math.floor(leads * apptRate * (0.9 + r() * 0.2) + r());
           const sales = Math.min(appts, Math.floor(appts * closeRate * (0.85 + r() * 0.3) + r()));
@@ -182,10 +210,14 @@ function seed(db) {
     }
     for (const [k, amt] of Object.entries(gl)) { const [m, l] = k.split('|'); insGl.run(m, bid, locRows[0].id, Number(l), Math.round(amt)); }
   }
+  // The demo budget lives where the real one will: by channel, market location and month.
+  db.exec(`INSERT INTO channel_plan (month, brand_id, location_id, channel_id, budget)
+           SELECT s.month, c.brand_id, s.location_id, l.channel_id, SUM(s.budget) FROM spend s JOIN campaign c ON c.id = s.campaign_id JOIN level1 l ON l.id = c.level1_id
+           GROUP BY 1, 2, 3, 4 HAVING SUM(s.budget) > 0`);
   ins('INSERT INTO audit (at, user, action, detail) VALUES (?, ?, ?, ?)').run(new Date().toISOString(), 'system', 'seed', 'Synthetic pilot data generated');
 }
 
-const TABLES = ['crm_fact', 'crm_name', 'spend', 'gl', 'gl_map', 'entity', 'campaign', 'level1', 'channel', 'location', 'brand'];
+const TABLES = ['channel_plan', 'crm_fact', 'crm_name', 'spend', 'gl', 'gl_map', 'entity', 'campaign', 'level1', 'channel', 'location', 'brand'];
 export const wipe = (db) => { for (const t of TABLES) db.exec('DELETE FROM ' + t); };
 export const getMode = (db) => db.prepare("SELECT value FROM setting WHERE key = 'mode'").get()?.value || 'synthetic';
 export const setMode = (db, mode) => db.prepare("INSERT INTO setting (key, value) VALUES ('mode', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(mode);
@@ -202,6 +234,16 @@ export function openDb({ reset = false } = {}) {
     db.exec('BEGIN');
     try { db.exec(SCHEMA); seed(db); setMode(db, 'synthetic'); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
   }
+  db.exec(`CREATE TABLE IF NOT EXISTS channel_plan (
+  month TEXT NOT NULL, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+  budget REAL NOT NULL DEFAULT 0,   -- annual budget from Vena, fixed
+  forecast REAL,                    -- channel re-forecast for an open month; NULL means "not re-forecast, use budget"
+  PRIMARY KEY (month, location_id, channel_id)
+);`);
+  if (!db.prepare('PRAGMA table_info(brand)').all().some((c) => c.name === 'region')) db.exec('ALTER TABLE brand ADD COLUMN region TEXT');
+  assignRegions(db);
+  // Databases created before spend links existed get the column added in place.
+  if (!db.prepare('PRAGMA table_info(campaign)').all().some((c) => c.name === 'linked_to')) db.exec('ALTER TABLE campaign ADD COLUMN linked_to INTEGER');
   return db;
 }
 

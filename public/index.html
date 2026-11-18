@@ -7,28 +7,42 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header class="top">
-    <div class="brandmark">Maestro <span class="tag">Prototype · synthetic data</span></div>
-    <nav id="nav">
-      <a href="#insights">Insights</a>
-      <a href="#projections">Projections</a>
-      <a href="#campaigns">Campaigns</a>
-      <a href="#mappings">Mappings</a>
-      <a href="#import">Import</a>
-    </nav>
-    <label class="role">Viewing as
-      <select id="role">
-        <option value="marketer">Marketing manager</option>
-        <option value="approver">Approver</option>
-        <option value="finance">Finance</option>
-      </select>
-    </label>
-  </header>
-  <div class="filters" id="filters">
-    <label>Brand <select id="f-brand"></select></label>
-    <label>Market location <select id="f-location"></select></label>
+  <div class="shell">
+    <aside class="side">
+      <div class="brandmark">Maestro</div>
+      <span class="tag">Prototype · synthetic data</span>
+      <nav id="nav" aria-label="Maestro sections">
+        <a href="#insights">Insights</a>
+        <a href="#projections">Projections</a>
+        <a href="#campaigns">Campaigns</a>
+        <a href="#mappings">Mappings</a>
+        <a href="#import">Import</a>
+      </nav>
+      <div class="side-foot">
+        <label>Currency
+          <div class="seg" id="cur" title="Display currency"><button data-cur="USD">USD</button><button data-cur="CAD">CAD</button></div>
+        </label>
+        <label>Viewing as
+          <select id="role">
+            <option value="marketer">Marketing manager</option>
+            <option value="approver">Approver</option>
+            <option value="finance">Finance</option>
+          </select>
+        </label>
+      </div>
+    </aside>
+    <div class="page">
+      <div class="filters" id="filters">
+        <label>Division <select id="f-division"></select></label>
+        <label>Region <select id="f-region"></select></label>
+        <label>Brand <select id="f-brand"></select></label>
+        <label>Market location <select id="f-location"></select></label>
+        <label>Year <select id="f-year"></select></label>
+        <span class="muted" id="fxnote"></span>
+      </div>
+      <main id="view"></main>
+    </div>
   </div>
-  <main id="view"></main>
   <div id="toast" role="status"></div>
   <script type="module" src="/app.js"></script>
 </body>

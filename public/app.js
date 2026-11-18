@@ -2,24 +2,28 @@
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const money = (n) => (n < 0 ? '-' : '') + '$' + Math.abs(Math.round(n)).toLocaleString('en-US');
-const compact = (n) => { const a = Math.abs(n); return (n < 0 ? '-' : '') + '$' + (a >= 1e6 ? (a / 1e6).toFixed(a >= 1e7 ? 1 : 2) + 'M' : a >= 1e4 ? Math.round(a / 1e3) + 'k' : Math.round(a).toLocaleString('en-US')); };
+const sym = () => (state.cur === 'CAD' ? 'CA$' : '$');
+const money = (n) => (n < 0 ? '-' : '') + sym() + Math.abs(Math.round(n)).toLocaleString('en-US');
+const compact = (n) => { const a = Math.abs(n); return (n < 0 ? '-' : '') + sym() + (a >= 1e6 ? (a / 1e6).toFixed(a >= 1e7 ? 1 : 2) + 'M' : a >= 1e4 ? Math.round(a / 1e3) + 'k' : Math.round(a).toLocaleString('en-US')); };
 const int = (n) => Math.round(n).toLocaleString('en-US');
 const pct = (n) => (Number.isFinite(n) ? (n * 100).toFixed(1) + '%' : '—');
-const ratio = (a, b, f) => (b > 0 ? f(a / b) : '—');
+const ratio = (a, b, f) => (b > 0.5 ? f(a / b) : '—');
 const cost = (a, b) => (a > 0 && b > 0 ? money(a / b) : '—');
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const mlabel = (m) => MON[Number(m.slice(5)) - 1];
 const COLORS = new Proxy([], { get: (_, i) => `var(--s${Math.min(9, Number(i) + 1)})` }); // channel colour by position; extras fold to grey
+const PLATFORMS = ['google_ads', 'bing_ads', 'meta_ads', 'active_prospect'];
+const PLATFORM_NAME = { google_ads: 'Google Ads', bing_ads: 'Bing Ads', meta_ads: 'Meta', active_prospect: 'Active Prospect' };
 const ROLES = { marketer: 'Marketing manager (demo)', approver: 'Approver (demo)', finance: 'Finance (demo)' };
 
-const state = { brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
+const saved = (() => { try { return localStorage.getItem('maestro-currency'); } catch { return null; } })();
+const state = { division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
 let meta, facts;
 
 async function api(path, body) {
   const res = await fetch(path, {
     method: body ? 'POST' : 'GET',
-    headers: { 'Content-Type': 'application/json', 'X-Maestro-Role': state.role, 'X-Maestro-User': ROLES[state.role] },
+    headers: { 'Content-Type': 'application/json', 'X-Maestro-Role': state.role, 'X-Maestro-Currency': state.cur, 'X-Maestro-User': ROLES[state.role] },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json();
@@ -31,13 +35,14 @@ function toast(msg, err) {
   clearTimeout(toast.t); toast.t = setTimeout(() => (t.style.display = 'none'), err ? 5000 : 2500);
 }
 const act = async (fn, ok) => { try { await fn(); if (ok) toast(ok); await render(); } catch (e) { toast(e.message, true); } };
-const scope = () => new URLSearchParams(Object.entries({ brand: state.brand, location: state.location }).filter(([, v]) => v)).toString();
+const scope = () => new URLSearchParams(Object.entries({ division: state.division, region: state.region, brand: state.brand, location: state.location }).filter(([, v]) => v)).toString();
 const opts = (rows, sel, label = (r) => r.name) => rows.map((r) => `<option value="${r.id}" ${String(r.id) === String(sel) ? 'selected' : ''}>${esc(label(r))}</option>`).join('');
 const closed = (m) => m <= meta.closedThrough;
+const yearMonths = () => meta.months.filter((m) => m.startsWith(state.year));
 const brandCode = (id) => meta.brands.find((b) => b.id === id)?.code;
 
 // ---- shared model ----------------------------------------------------------
-function buildModel(f) {
+function buildModel(f, rollup = false) {
   const l1 = Object.fromEntries(meta.level1.map((l) => [l.id, l]));
   const ch = Object.fromEntries(meta.channels.map((c) => [c.id, c]));
   const blank = () => ({ budget: 0, actual: 0, projected: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
@@ -49,6 +54,12 @@ function buildModel(f) {
     const c = k.campaign_id ? camps.get(k.campaign_id) : null;
     Object.assign(cell(c ? c.m : unmapped, k.month), { leads: k.leads, appts: k.appts, sales: k.sales, bookings: k.bookings });
   }
+  if (rollup) for (const c of [...camps.values()]) {
+    const target = c.linked_to && camps.get(c.linked_to);
+    if (!target) continue;
+    for (const [m, v] of Object.entries(c.m)) { const t = cell(target.m, m); t.budget += v.budget; t.actual += v.actual; t.projected += v.projected; }
+    (target.sourceList ||= []).push(c); target.sources = target.sourceList.length; camps.delete(c.id);
+  }
   return { camps: [...camps.values()], unmapped, blank };
 }
 function sum(c, months, into) {
@@ -59,7 +70,7 @@ function sum(c, months, into) {
 const add = (a, b) => { for (const k in a) a[k] += b[k]; return a; };
 
 // ---- chart -----------------------------------------------------------------
-function stackedChart(host, { months, series, markers, fmt }) {
+function stackedChart(host, { months, series, markers, fmt, selected, onMonth }) {
   const W = 960, H = 280, L = 56, R = 12, T = 12, B = 30, pw = W - L - R, ph = H - T - B;
   const totals = months.map((_, i) => series.reduce((a, s) => a + s.values[i], 0));
   const max = Math.max(1, ...totals, ...(markers || []));
@@ -67,8 +78,11 @@ function stackedChart(host, { months, series, markers, fmt }) {
   const top = Math.ceil(max / step) * step, y = (v) => T + ph - (v / top) * ph, bw = pw / months.length, w = Math.min(44, bw * 0.6);
   let svg = '';
   for (let v = 0; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${v ? 'var(--grid)' : 'var(--axis)'}"/><text x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`;
+  // Selected months sit on a wash; the hover band follows the pointer.
+  if (selected) months.forEach((m, i) => { if (selected.includes(m)) svg += `<rect x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="var(--wash)"/>`; });
+  svg += `<rect class="hov" x="0" y="${T}" width="${bw}" height="${ph}" fill="var(--ink)" opacity="0" pointer-events="none"/>`;
   months.forEach((m, i) => {
-    const x = L + bw * i + (bw - w) / 2, op = closed(m) ? 1 : 0.45;
+    const x = L + bw * i + (bw - w) / 2, op = (closed(m) ? 1 : 0.45) * (selected && !selected.includes(m) ? 0.4 : 1);
     let base = 0;
     const live = series.map((s, si) => ({ s, si })).filter((o) => o.s.values[i] > 0);
     live.forEach(({ s }, k) => {
@@ -77,38 +91,47 @@ function stackedChart(host, { months, series, markers, fmt }) {
       base += v;
     });
     if (markers && markers[i] > 0) svg += `<line x1="${x - 5}" x2="${x + w + 5}" y1="${y(markers[i])}" y2="${y(markers[i])}" stroke="var(--ink)" stroke-width="2"/>`;
-    svg += `<text x="${L + bw * i + bw / 2}" y="${H - 10}" text-anchor="middle">${mlabel(m)}${closed(m) ? '' : '*'}</text><rect data-i="${i}" x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="transparent"/>`;
+    svg += `<text x="${L + bw * i + bw / 2}" y="${H - 10}" text-anchor="middle">${mlabel(m)}${closed(m) ? '' : '*'}</text><rect data-i="${i}" x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="transparent" style="cursor:${onMonth && closed(m) ? 'pointer' : 'default'}"/>`;
   });
   host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Monthly stacked bars by channel">${svg}</svg><div class="tip"></div>`;
-  const tip = $('.tip', host);
+  const tip = $('.tip', host), hov = $('.hov', host);
+  host.onclick = (e) => { const i = e.target.dataset?.i; if (i != null && onMonth && closed(months[i])) onMonth(months[i]); };
   host.onmousemove = (e) => {
-    const i = e.target.dataset?.i; if (i == null) return (tip.style.display = 'none');
+    const i = e.target.dataset?.i; if (i == null) { hov.setAttribute('opacity', 0); return (tip.style.display = 'none'); }
+    hov.setAttribute('x', L + bw * i); hov.setAttribute('opacity', 0.06);
     tip.innerHTML = `<b>${mlabel(months[i])} ${months[i].slice(0, 4)}${closed(months[i]) ? '' : ' · projected'}</b>` +
       series.map((s) => `<div><span><i class="dot" style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.values[i])}</span></div>`).join('') +
       `<div><span><b style="display:inline">Total</b></span><span><b style="display:inline">${fmt(totals[i])}</b></span></div>` +
-      (markers ? `<div><span>Budget</span><span>${fmt(markers[i])}</span></div>` : '');
+      (markers ? `<div><span>Budget</span><span>${fmt(markers[i])}</span></div>` : '') +
+      (onMonth && closed(months[i]) ? `<div style="margin-top:4px"><span>${selected?.length === 1 && selected[0] === months[i] ? 'Click to go back to the full period' : 'Click to focus the page on this month'}</span></div>` : '');
     const box = host.getBoundingClientRect(); tip.style.display = 'block';
     tip.style.left = Math.min(e.clientX - box.left + 14, box.width - tip.offsetWidth - 4) + 'px'; tip.style.top = Math.max(0, e.clientY - box.top - 20) + 'px';
   };
-  host.onmouseleave = () => (tip.style.display = 'none');
+  host.onmouseleave = () => { tip.style.display = 'none'; hov.setAttribute('opacity', 0); };
 }
 
 // ---- Insights --------------------------------------------------------------
 async function insights(el) {
   facts = await api('/api/facts?' + scope());
-  const closedMonths = meta.months.filter(closed);
-  state.from ||= closedMonths[0]; state.to ||= closedMonths.at(-1);
+  const closedMonths = yearMonths().filter(closed);
+  if (!closedMonths.length) { el.innerHTML = `<h1>Insights · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Projections screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
+  if (!closedMonths.includes(state.from) || !closedMonths.includes(state.to)) { state.from = closedMonths[0]; state.to = closedMonths.at(-1); }
   drawInsights(el);
 }
 function drawInsights(el) {
-  const { camps, unmapped } = buildModel(facts);
-  const closedMonths = meta.months.filter(closed);
+  const { camps, unmapped } = buildModel(facts, true);
+  const closedMonths = yearMonths().filter(closed);
+  const feeds = buildModel(facts).camps.filter((c) => PLATFORMS.includes(c.source)).map((c) => ({ c, t: sum(c, closedMonths.filter((m) => m >= state.from && m <= state.to)) }));
+  const feedSpend = feeds.reduce((a, r) => a + r.t.actual, 0), feedLinked = feeds.filter((r) => r.c.linked_to || r.t.leads > 0).reduce((a, r) => a + r.t.actual, 0);
   const range = closedMonths.filter((m) => m >= state.from && m <= state.to);
   const tot = camps.reduce((t, c) => sum(c, range, t), undefined) || sum({}, []);
   const un = sum(unmapped, range);
-  const rows = camps.map((c) => ({ c, t: sum(c, range) })).filter((r) => r.t.actual || r.t.leads || r.t.budget);
+  const planBudget = (months, chId) => facts.plan.reduce((a, p) => a + (months.includes(p.month) && (chId == null || p.channel_id === chId) ? p.budget : 0), 0);
+  for (const c of camps) for (const m in c.m) c.m[m].budget = 0; // campaign rows carry no budget of their own
+  tot.budget = planBudget(range);
+  const rows = camps.map((c) => ({ c, t: sum(c, range) })).filter((r) => r.t.actual || r.t.leads);
   const blended = tot.actual ? tot.bookings / tot.actual : 0;
-  const weak = (r) => r.c.source !== 'gl_unallocated' && r.t.leads > 0 && r.t.actual > tot.actual * 0.01 && r.t.bookings / r.t.actual < blended * 0.5;
+  const weak = (r) => !r.c.source.startsWith('gl_') && r.t.leads > 0 && r.t.actual > tot.actual * 0.01 && r.t.bookings / r.t.actual < blended * 0.5;
   const v = tot.budget ? tot.actual / tot.budget - 1 : 0;
   const tiles = [
     ['Spend', compact(tot.actual), tot.budget ? `<span class="${v > 0 ? 'down' : 'up'}">${v > 0 ? '▲' : '▼'} ${pct(Math.abs(v))}</span> vs budget ${compact(tot.budget)}` : 'No budget loaded yet'],
@@ -118,27 +141,42 @@ function drawInsights(el) {
     ['Bookings $', compact(tot.bookings), `Conversion ${ratio(tot.appts, tot.leads, pct)} lead → appt`],
     ['ROAS', ratio(tot.bookings, tot.actual, (x) => x.toFixed(1) + 'x'), `MCOB ${ratio(tot.actual, tot.bookings, pct)}`],
   ];
+  // Footnote: third-party campaign detail only exists from the day each platform feed was switched on.
+  const starts = Object.entries(meta.feedStart || {}).sort((a, b) => a[1].localeCompare(b[1]));
+  const day = (d) => new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const feedNote = starts.length && state.from <= starts.at(-1)[1].slice(0, 7)
+    ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${day(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier months campaign-level CPL and CPA read lower, and ROAS higher, than they really were. Level 1 and channel figures are unaffected.</p>` : '';
   const measures = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', bookings: 'Bookings $' };
   const head = '<tr><th>Channel / Level 1 / Campaign</th><th>Spend</th><th>Budget</th><th>Var</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>Close %</th><th>ROAS</th><th class="l">Flag</th></tr>';
-  const line = (cls, key, label, t, flag = '') => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td><td>${money(t.actual)}</td><td>${money(t.budget)}</td>
-    <td class="${t.actual > t.budget ? 'down' : ''}">${ratio(t.actual - t.budget, t.budget, (x) => (x > 0 ? '+' : '') + pct(x))}</td><td>${int(t.leads)}</td><td>${int(t.appts)}</td><td>${int(t.sales)}</td><td>${money(t.bookings)}</td>
+  const line = (cls, key, label, t, flag = '') => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td><td>${money(t.actual)}</td><td>${t.budget ? money(t.budget) : '—'}</td>
+    <td class="${t.budget && t.actual > t.budget ? 'down' : ''}">${ratio(t.actual - t.budget, t.budget, (x) => (x > 0 ? '+' : '') + pct(x))}</td><td>${int(t.leads)}</td><td>${int(t.appts)}</td><td>${int(t.sales)}</td><td>${money(t.bookings)}</td>
     <td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td>${ratio(t.bookings, t.actual, (x) => x.toFixed(1) + 'x')}</td><td class="l">${flag}</td></tr>`;
   let body = '';
   meta.channels.forEach((ch, ci) => {
     const inCh = rows.filter((r) => r.c.channel.id === ch.id); if (!inCh.length) return;
     const chOpen = !state.open.has('c' + ch.id); // channels start expanded
-    body += line('ch', 'c' + ch.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(ch.name)}`, inCh.reduce((t, r) => add(t, r.t), sum({}, [])));
+    body += line('ch', 'c' + ch.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(ch.name)}`, Object.assign(inCh.reduce((t, r) => add(t, r.t), sum({}, [])), { budget: planBudget(range, ch.id) }));
     if (!chOpen) return;
     for (const l of meta.level1.filter((l) => l.channel_id === ch.id)) {
       const inL = inCh.filter((r) => r.c.level1.id === l.id); if (!inL.length) continue;
       const lOpen = state.open.has('l' + l.id), nWeak = inL.filter(weak).length;
       body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, inL.reduce((t, r) => add(t, r.t), sum({}, [])), nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '');
       if (lOpen) for (const r of inL.sort((a, b) => b.t.actual - a.t.actual))
-        body += line('cp', '', esc(r.c.name) + (state.brand ? '' : ` <span class="muted">· ${brandCode(r.c.brand_id)}</span>`), r.t, weak(r) ? '<span class="chip warn">⚠ Low return</span> <a href="#projections">Reallocate</a>' : '');
+      {
+        // A campaign fed by linked ad-platform campaigns opens to show them: the lowest level of third-party detail.
+        const srcKey = r.c.sources ? 's' + r.c.id : '', srcOpen = srcKey && state.open.has(srcKey);
+        body += line('cp', srcKey, (srcKey ? (srcOpen ? '▾ ' : '▸ ') : '') + esc(r.c.name) + (state.brand ? '' : ` <span class="muted">· ${brandCode(r.c.brand_id)}</span>`) + (r.c.sources ? ` <span class="chip">${r.c.sources} spend source${r.c.sources > 1 ? 's' : ''}</span>` : ''), r.t, weak(r) ? '<span class="chip warn">⚠ Low return</span> <a href="#projections">Reallocate</a>' : '');
+        if (srcOpen) {
+          const srcs = r.c.sourceList.map((s) => ({ s, spend: sum(s, range).actual })).sort((a, b) => b.spend - a.spend);
+          const linked = srcs.reduce((a, x) => a + x.spend, 0);
+          for (const x of srcs) body += `<tr class="src"><td>${esc(x.s.name)} <span class="chip">${PLATFORM_NAME[x.s.source] || esc(x.s.source)}</span></td><td>${money(x.spend)}</td><td colspan="11" class="l muted">${x.spend ? `${pct(linked ? x.spend / linked : 0)} of this campaign's platform spend` : 'No spend in this period'} · ${esc(x.s.level1.name)}</td></tr>`;
+          if (Math.abs(r.t.actual - linked) > 1) body += `<tr class="src"><td class="muted">Spend recorded on the CRM campaign itself</td><td>${money(r.t.actual - linked)}</td><td colspan="11"></td></tr>`;
+        }
+      }
     }
   });
   if (un.leads) body += line('l1', '', 'Not mapped to a campaign', un, '<a href="#mappings">Map names</a>');
-  body += line('total', '', 'Total', add({ ...tot }, un));
+  body += line('total', '', 'Total', Object.assign(add({ ...tot }, un), { budget: tot.budget }));
 
   el.innerHTML = `
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
@@ -147,23 +185,31 @@ function drawInsights(el) {
       <label>To <select id="to">${closedMonths.map((m) => `<option ${m === state.to ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label></div>
     </div>
     ${un.leads ? `<div class="banner">${int(un.leads)} leads and ${money(un.bookings)} of bookings in this period sit under CRM campaign names that are not mapped yet. <a href="#mappings">Review mappings</a></div>` : ''}
+    ${feedSpend ? `<div class="banner" style="background:var(--wash);border-color:#cfe0f5">${compact(feedLinked)} of ${compact(feedSpend)} ad-platform spend (${pct(feedLinked / feedSpend)}) is linked to a CRM campaign, so those campaigns show their own CPL, CPA and ROAS. The rest meets its outcomes at Level 1 only. <a href="#mappings" id="go-links">Review spend links</a></div>` : ''}
+    ${(() => { const off = meta.mode === 'real' ? meta.brands.filter((b) => !b.in_ledger && (!state.brand || String(b.id) === state.brand) && camps.some((c) => c.brand_id === b.id && sum(c, range).actual)) : []; return off.length ? `<div class="banner">${off.map((b) => esc(b.name)).join(', ')} ${off.length > 1 ? 'are' : 'is'} not in any loaded ledger. ${off.length > 1 ? 'Their' : 'Its'} spend here is ad-platform feeds only, so anything bought outside those platforms is missing.</div>` : ''; })()}
     <div class="tiles">${tiles.map(([k, val, d]) => `<div class="tile"><div class="k">${k}</div><div class="v">${val}</div><div class="d">${d}</div></div>`).join('')}</div>
     <div class="card">
-      <div class="row" style="justify-content:space-between"><div><h2>${measures[state.measure]} by channel, by month</h2><p class="sub" style="margin:0">Full year. Months marked * are open: spend shown is the current projection and outcomes are not in yet.</p></div>
-      <div class="seg">${Object.entries(measures).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div>
-      <div class="legend">${meta.channels.map((c, i) => `<span><i style="background:${COLORS[i]}"></i>${esc(c.name)}</span>`).join('')}${state.measure === 'spend' ? '<span><i class="tick"></i>Budget</span>' : ''}</div>
+      <div class="row" style="justify-content:space-between"><div><h2>${measures[state.measure]} by channel, by month</h2><p class="sub" style="margin:0">${state.year}. Months marked * are open: spend shown is the current projection and outcomes are not in yet. Click a month to focus the whole page on it; click a channel in the legend to hide or show it.</p></div>
+      ${range.length < closedMonths.length ? '<button id="full-range">Back to full period</button>' : ''}<div class="seg">${Object.entries(measures).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div>
+      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Show or hide ${esc(c.name)} in the chart"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${state.measure === 'spend' && planBudget(yearMonths()) ? '<span><i class="tick"></i>Budget</span>' : ''}</div>
       <div class="chart" id="chart"></div>
     </div>
-    <div class="card"><h2>Channel and Level 1 performance</h2><p class="sub">${mlabel(state.from)} to ${mlabel(state.to)} ${state.to.slice(0, 4)}. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
-      <div class="scroll"><table>${head}${body}</table></div></div>`;
+    <div class="card"><h2>Channel and Level 1 performance</h2><p class="sub">${mlabel(state.from)} to ${mlabel(state.to)} ${state.to.slice(0, 4)}. Level 1 spend for closed months equals the Acumatica ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
+      <div class="scroll"><table>${head}${body}</table></div>${feedNote}</div>`;
 
   const val = (c, m) => { const x = c.m[m]; if (!x) return 0; return state.measure === 'spend' ? (closed(m) ? x.actual : x.projected) : x[state.measure]; };
   stackedChart($('#chart'), {
-    months: meta.months,
-    series: meta.channels.map((ch, i) => ({ name: ch.name, color: COLORS[i], values: meta.months.map((m) => camps.filter((c) => c.channel.id === ch.id).reduce((a, c) => a + val(c, m), 0)) })),
-    markers: state.measure === 'spend' ? meta.months.map((m) => camps.reduce((a, c) => a + (c.m[m]?.budget || 0), 0)) : null,
+    months: yearMonths(),
+    series: meta.channels.map((ch, i) => ({ id: ch.id, name: ch.name, color: COLORS[i], values: yearMonths().map((m) => camps.filter((c) => c.channel.id === ch.id).reduce((a, c) => a + val(c, m), 0)) })).filter((s) => !state.hiddenCh.has(s.id)),
+    selected: range.length < closedMonths.length ? range : null,
+    onMonth: (m) => { if (state.from === m && state.to === m) { state.from = closedMonths[0]; state.to = closedMonths.at(-1); } else state.from = state.to = m; drawInsights(el); },
+    markers: state.measure === 'spend' && planBudget(yearMonths()) ? yearMonths().map((m) => planBudget([m])) : null,
     fmt: state.measure === 'spend' || state.measure === 'bookings' ? compact : int,
   });
+  $$('[data-lg]', el).forEach((b) => (b.onclick = () => { const id = Number(b.dataset.lg); state.hiddenCh.has(id) ? state.hiddenCh.delete(id) : state.hiddenCh.add(id); drawInsights(el); }));
+  if ($('#lg-all')) $('#lg-all').onclick = () => { state.hiddenCh.clear(); drawInsights(el); };
+  if ($('#full-range')) $('#full-range').onclick = () => { state.from = closedMonths[0]; state.to = closedMonths.at(-1); drawInsights(el); };
+  if ($('#go-links')) $('#go-links').onclick = () => { state.mapTab = 'links'; };
   $('#from').onchange = (e) => { state.from = e.target.value; if (state.to < state.from) state.to = state.from; drawInsights(el); };
   $('#to').onchange = (e) => { state.to = e.target.value; if (state.from > state.to) state.from = state.to; drawInsights(el); };
   $$('[data-measure]', el).forEach((b) => (b.onclick = () => { state.measure = b.dataset.measure; drawInsights(el); }));
@@ -174,16 +220,45 @@ function drawInsights(el) {
 async function projections(el) {
   facts = await api('/api/facts?' + scope());
   const { camps } = buildModel(facts);
-  const months = meta.months, openMonths = months.filter((m) => !closed(m)), closedMonths = months.filter(closed), last3 = closedMonths.slice(-3);
-  const rows = camps.filter((c) => months.some((m) => c.m[m] && (c.m[m].budget || c.m[m].actual || c.m[m].projected)));
-  const outlook = (c) => months.reduce((a, m) => a + (c.m[m] ? (closed(m) ? c.m[m].actual : c.m[m].projected) : 0), 0);
-  const fy = (c, k) => months.reduce((a, m) => a + (c.m[m]?.[k] || 0), 0);
+  const months = yearMonths(), openMonths = months.filter((m) => !closed(m)), closedMonths = months.filter(closed), last3 = meta.months.filter(closed).slice(-3);
+  const rows = camps.filter((c) => months.some((m) => c.m[m] && (c.m[m].actual || c.m[m].projected)));
+  const val = (c, m) => (c.m[m] ? (closed(m) ? c.m[m].actual : c.m[m].projected) : 0);
+  const outlook = (c) => months.reduce((a, m) => a + val(c, m), 0);
   const trail = (c) => sum(c, last3);
-  const T = { budget: 0, ytd: 0, ytdBudget: 0, open: 0, openBudget: 0 };
-  for (const c of rows) { T.budget += fy(c, 'budget'); for (const m of months) { const x = c.m[m]; if (!x) continue; if (closed(m)) { T.ytd += x.actual; T.ytdBudget += x.budget; } else { T.open += x.projected; T.openBudget += x.budget; } } }
-  const out = T.ytd + T.open, d = out - T.budget;
+
+  // Channel level: actuals for closed months; for open months the re-forecast if one was entered,
+  // otherwise the budget, otherwise what the campaigns underneath add up to.
+  const plan = new Map(facts.plan.map((p) => [`${p.brand_id}|${p.channel_id}|${p.month}`, p]));
+  const brandIds = [...new Set([...rows.map((c) => c.brand_id), ...facts.plan.map((p) => p.brand_id)])];
+  const chRows = meta.channels.map((ch) => {
+    const inCh = rows.filter((c) => c.channel.id === ch.id);
+    const cells = months.map((m) => {
+      const x = { m, budget: 0, detail: 0, forecast: 0, set: false };
+      for (const b of brandIds) {
+        const p = plan.get(`${b}|${ch.id}|${m}`), detail = inCh.reduce((t, c) => t + (c.brand_id === b ? val(c, m) : 0), 0);
+        x.budget += p?.budget || 0; x.detail += detail;
+        if (p?.n) x.set = true;
+        x.forecast += closed(m) ? detail : p?.n ? p.eff : p?.budget || detail;
+      }
+      return x;
+    });
+    return { ch, cells };
+  }).filter((r) => r.cells.some((x) => x.budget || x.detail || x.forecast));
+  const T = { budget: 0, ytd: 0, ytdBudget: 0, open: 0, openBudget: 0, detail: 0 };
+  for (const r of chRows) for (const x of r.cells) { T.budget += x.budget; if (closed(x.m)) { T.ytd += x.detail; T.ytdBudget += x.budget; } else { T.open += x.forecast; T.openBudget += x.budget; T.detail += x.detail; } }
+  const out = T.ytd + T.open, d = out - T.budget, canEdit = !!state.brand, hasBudget = T.budget > 0;
+  const chBody = chRows.map((r, i) => {
+    const b = r.cells.reduce((t, x) => t + x.budget, 0), o = r.cells.reduce((t, x) => t + x.forecast, 0);
+    const od = r.cells.filter((x) => !closed(x.m)), det = od.reduce((t, x) => t + x.detail, 0), fc = od.reduce((t, x) => t + x.forecast, 0);
+    return `<tr><td class="l"><i class="dot" style="background:${COLORS[meta.channels.indexOf(r.ch)]}"></i>${esc(r.ch.name)}</td>` + r.cells.map((x) => {
+      const tip = `Budget ${money(x.budget)} · campaigns ${money(x.detail)}`;
+      return closed(x.m) || !canEdit ? `<td class="${closed(x.m) ? 'closed' : ''}" title="${tip}">${x.forecast ? int(x.forecast) : '—'}</td>`
+        : `<td class="cell"><input type="number" min="0" step="100" class="${x.set ? 'set' : ''}" value="${Math.round(x.forecast)}" data-ch="${r.ch.id}" data-m="${x.m}" data-was="${Math.round(x.forecast)}" title="${tip}${x.set ? ' · re-forecast (clear the cell to go back to budget)' : ''}" aria-label="${esc(r.ch.name)} forecast ${mlabel(x.m)}"></td>`;
+    }).join('') + `<td>${b ? money(b) : '—'}</td><td>${money(o)}</td><td class="${b && o > b ? 'down' : ''}">${b ? money(o - b) : '—'}</td><td>${money(det)}</td><td class="${Math.abs(fc - det) > 1 ? '' : 'muted'}">${money(fc - det)}</td></tr>`;
+  }).join('');
+
+  // Campaign level. Across all brands the grid would run to hundreds of rows, so it rolls up to Level 1 and becomes read-only.
   const label = (c) => c.name + (state.brand || c.rollup ? '' : ` · ${brandCode(c.brand_id)}`);
-  // Across all brands the grid would run to hundreds of rows, so it rolls up to Level 1 and becomes read-only.
   const wide = !state.brand && rows.length > 150;
   const shown = !wide ? rows : meta.level1.map((l) => {
     const inL = rows.filter((c) => c.level1.id === l.id), m = {};
@@ -193,31 +268,34 @@ async function projections(el) {
   let body = '';
   for (const l of meta.level1) {
     const inL = shown.filter((c) => c.level1.id === l.id); if (!inL.length) continue;
-    if (!wide) body += `<tr class="group"><td colspan="${months.length + 5}">${esc(l.name)} <span class="muted">· ${esc(inL[0].channel.name)}</span></td></tr>`;
+    if (!wide) body += `<tr class="group"><td colspan="${months.length + 3}">${esc(l.name)} <span class="muted">· ${esc(inL[0].channel.name)}</span></td></tr>`;
     for (const c of inL) {
-      const t = trail(c), o = outlook(c), b = fy(c, 'budget');
+      const t = c.rollup ? inL.length && rows.filter((x) => x.level1.id === l.id).reduce((s, x) => add(s, trail(x)), sum({}, [])) : trail(c);
       body += `<tr><td class="l">${esc(label(c))}</td>` + months.map((m) => {
-        const x = c.m[m] || { actual: 0, projected: 0, budget: 0 };
-        return closed(m) || wide ? `<td class="${closed(m) ? 'closed' : ''}" title="Budget ${money(x.budget)}">${(closed(m) ? x.actual : x.projected) ? int(closed(m) ? x.actual : x.projected) : '—'}</td>`
-          : `<td class="cell"><input type="number" min="0" step="10" value="${Math.round(x.projected)}" data-c="${c.id}" data-m="${m}" data-was="${Math.round(x.projected)}" title="Budget ${money(x.budget)}" aria-label="${esc(c.name)} projected ${mlabel(m)}"></td>`;
-      }).join('') + `<td>${money(b)}</td><td>${money(o)}</td><td class="${o > b ? 'down' : ''}">${money(o - b)}</td><td>${cost(t.actual, t.appts)}</td></tr>`;
+        const x = c.m[m] || { actual: 0, projected: 0 }, v = closed(m) ? x.actual : x.projected;
+        return closed(m) || wide ? `<td class="${closed(m) ? 'closed' : ''}">${v ? int(v) : '—'}</td>`
+          : `<td class="cell"><input type="number" min="0" step="10" value="${Math.round(x.projected)}" data-c="${c.id}" data-m="${m}" data-was="${Math.round(x.projected)}" aria-label="${esc(c.name)} projected ${mlabel(m)}"></td>`;
+      }).join('') + `<td>${money(outlook(c))}</td><td>${ratio(t.actual, t.appts, money)}</td></tr>`;
     }
   }
-  const glMonths = closedMonths; state.glMonth ||= glMonths.at(-1);
-  const glRows = meta.level1.map((l) => ({ l, gl: facts.gl.filter((g) => g.level1_id === l.id && g.month === state.glMonth).reduce((a, g) => a + g.amount, 0),
-    src: rows.filter((c) => c.level1.id === l.id && c.source !== 'gl_unallocated').reduce((a, c) => a + (c.m[state.glMonth]?.actual || 0), 0) })).filter((r) => r.gl || r.src);
+  state.glMonth = closedMonths.includes(state.glMonth) ? state.glMonth : closedMonths.at(-1);
+  const glRows = !state.glMonth ? [] : meta.level1.map((l) => ({ l, gl: facts.gl.filter((g) => g.level1_id === l.id && g.month === state.glMonth).reduce((a, g) => a + g.amount, 0),
+    src: rows.filter((c) => c.level1.id === l.id && !c.source.startsWith('gl_')).reduce((a, c) => a + (c.m[state.glMonth]?.actual || 0), 0) })).filter((r) => r.gl || r.src);
   const glT = glRows.reduce((t, r) => ({ gl: t.gl + r.gl, src: t.src + r.src }), { gl: 0, src: 0 });
   const note = (x, gl) => (Math.abs(x) < Math.max(50, gl * 0.02) ? 'Tied out' : x > 0 ? 'In GL, not tied to a campaign: allocate' : 'Sourced, not in GL yet: accrual candidate');
+  const th = months.map((m) => `<th>${mlabel(m)}${closed(m) ? '' : '*'}</th>`).join('');
 
   el.innerHTML = `
-    <h1>Projections</h1><p class="sub">Budget is fixed for the year. Closed months show actual spend. Edit the open months to re-forecast, or move dollars between campaigns.</p>
+    <h1>Projections · ${state.year}</h1><p class="sub">Budget is set once a year by channel and does not move. The channel forecast is the official outlook and is re-forecast monthly; campaign projections are the detail underneath, refreshed quarterly.</p>
     <div class="tiles">
-      <div class="tile"><div class="k">Annual budget</div><div class="v">${compact(T.budget)}</div><div class="d">Set once, does not move</div></div>
-      <div class="tile"><div class="k">Actual to date</div><div class="v">${compact(T.ytd)}</div><div class="d">Budget to date ${compact(T.ytdBudget)}</div></div>
-      <div class="tile"><div class="k">Projected, open months</div><div class="v">${compact(T.open)}</div><div class="d">Budget for those months ${compact(T.openBudget)}</div></div>
-      <div class="tile"><div class="k">Full-year outlook</div><div class="v">${compact(out)}</div><div class="d"><span class="${d > 0 ? 'down' : 'up'}">${d > 0 ? '▲' : '▼'} ${compact(Math.abs(d))}</span> ${d > 0 ? 'over' : 'under'} budget</div></div>
+      <div class="tile"><div class="k">Annual budget</div><div class="v">${hasBudget ? compact(T.budget) : '—'}</div><div class="d">${hasBudget ? 'Set once, does not move' : 'No budget loaded for ' + state.year}</div></div>
+      <div class="tile"><div class="k">Actual to date</div><div class="v">${compact(T.ytd)}</div><div class="d">${hasBudget ? 'Budget to date ' + compact(T.ytdBudget) : closedMonths.length + ' closed months'}</div></div>
+      <div class="tile"><div class="k">Channel forecast, open months</div><div class="v">${compact(T.open)}</div><div class="d">Campaign detail ${compact(T.detail)} · unassigned ${compact(T.open - T.detail)}</div></div>
+      <div class="tile"><div class="k">Full-year outlook</div><div class="v">${compact(out)}</div><div class="d">${hasBudget ? `<span class="${d > 0 ? 'down' : 'up'}">${d > 0 ? '▲' : '▼'} ${compact(Math.abs(d))}</span> ${d > 0 ? 'over' : 'under'} budget` : 'Actuals plus channel forecast'}</div></div>
     </div>
-    ${wide ? '<div class="banner">Showing Level 1 totals across all brands. Pick a brand above to re-forecast campaigns or move spend.</div>' : `<div class="card"><h2>Move spend between campaigns</h2><p class="sub">Takes projected dollars from one campaign and gives them to another in the same open month. The estimate uses each campaign's cost per appointment over the last three closed months.</p>
+    <div class="card"><h2>Channel forecast, monthly</h2><p class="sub">Grey cells are actuals. ${canEdit ? 'White cells are the forecast for open months: type a new figure and press Enter to re-forecast. A bold cell has been re-forecast; clear it to return to budget.' : 'Pick a brand above to re-forecast.'} Until a month is re-forecast it shows the budget, or the campaign total where there is no budget. "Unassigned" is channel forecast not yet given to a campaign.</p>
+      <div class="scroll"><table><tr><th>Channel</th>${th}<th>FY budget</th><th>FY outlook</th><th>Var</th><th>Campaigns, open mo</th><th>Unassigned</th></tr>${chBody || `<tr><td class="l muted" colspan="${months.length + 6}">Nothing for ${state.year} yet. Load a budget on the Import screen or pick a brand and enter a forecast.</td></tr>`}</table></div></div>
+    ${wide ? '<div class="banner">Campaign detail below shows Level 1 totals across all brands. Pick a brand above to re-forecast campaigns or move spend.</div>' : !openMonths.length || rows.length < 2 ? '' : `<div class="card"><h2>Move spend between campaigns</h2><p class="sub">Takes projected dollars from one campaign and gives them to another in the same open month. The estimate uses each campaign's cost per appointment over the last three closed months.</p>
       <div class="row">
         <label>From <select id="r-from">${opts(rows, null, label)}</select></label>
         <label>To <select id="r-to">${opts(rows, rows[1]?.id, label)}</select></label>
@@ -225,33 +303,39 @@ async function projections(el) {
         <label>Amount <input id="r-amt" type="number" min="0" step="100" value="1000" style="width:110px"></label>
         <button class="primary" id="r-go">Move spend</button>
       </div><div class="preview" id="r-prev"></div></div>`}
-    <div class="card"><h2>Spend by campaign and month</h2><p class="sub">Grey cells are actuals. White cells are projected spend you can edit; press Enter or leave the cell to save. Hover a cell for its budget.</p>
-      <div class="scroll"><table><tr><th>${wide ? 'Level 1' : 'Campaign'}</th>${months.map((m) => `<th>${mlabel(m)}${closed(m) ? '' : '*'}</th>`).join('')}<th>FY budget</th><th>FY outlook</th><th>Var</th><th>CPA, last 3 mo</th></tr>${body}</table></div></div>
-    ${state.location ? '<div class="card"><h2>GL reconciliation</h2><p class="sub">The general ledger is held by brand, so clear the market location filter to see it.</p></div>' : `
+    <div class="card"><h2>Campaign detail, quarterly</h2><p class="sub">Grey cells are actuals. White cells are projected spend you can edit; press Enter or leave the cell to save.</p>
+      <div class="scroll"><table><tr><th>${wide ? 'Level 1' : 'Campaign'}</th>${th}<th>FY outlook</th><th>CPA, last 3 mo</th></tr>${body || `<tr><td class="l muted" colspan="${months.length + 3}">No campaign spend or projections for ${state.year} yet.</td></tr>`}</table></div></div>
+    ${!state.glMonth ? '' : state.location ? '<div class="card"><h2>GL reconciliation</h2><p class="sub">Connected feeds are mostly held by brand, so clear the market location filter to see the reconciliation.</p></div>' : `
     <div class="card"><div class="row" style="justify-content:space-between"><div><h2>GL reconciliation and accrual signal</h2><p class="sub">General ledger marketing spend against spend tied to campaigns, by Level 1.</p></div>
-      <label>Month <select id="gl-month">${glMonths.map((m) => `<option ${m === state.glMonth ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label></div>
+      <label>Month <select id="gl-month">${closedMonths.map((m) => `<option ${m === state.glMonth ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label></div>
       <div class="scroll"><table><tr><th>Level 1</th><th>GL account</th><th>GL actual</th><th>Tied to campaigns</th><th>Difference</th><th class="l">Reading</th></tr>
       ${glRows.map((r) => `<tr><td>${esc(r.l.name)}</td><td>${esc(r.l.gl_account || '—')}</td><td>${money(r.gl)}</td><td>${money(r.src)}</td><td>${money(r.gl - r.src)}</td><td class="l muted">${note(r.gl - r.src, r.gl)}</td></tr>`).join('')}
       <tr class="total"><td>Total</td><td></td><td>${money(glT.gl)}</td><td>${money(glT.src)}</td><td>${money(glT.gl - glT.src)}</td><td class="l">${ratio(glT.src, glT.gl, pct)} of GL explained</td></tr></table></div></div>`}`;
 
-  const byId = (id) => rows.find((c) => String(c.id) === String(id));
-  const preview = () => {
-    const a = byId($('#r-from').value), b = byId($('#r-to').value), m = $('#r-month').value, amt = Number($('#r-amt').value) || 0;
-    if (!a || !b) return;
-    const ta = trail(a), tb = trail(b), cpa = (t) => (t.appts ? t.actual / t.appts : null), roas = (t) => (t.actual ? t.bookings / t.actual : null);
-    const lose = cpa(ta) ? amt / cpa(ta) : 0, gain = cpa(tb) ? amt / cpa(tb) : 0, bk = amt * ((roas(tb) || 0) - (roas(ta) || 0));
-    const have = a.m[m]?.projected || 0;
-    $('#r-prev').innerHTML = a.brand_id !== b.brand_id ? 'Pick two campaigns from the same brand.' :
-      `${esc(a.name)} has ${money(have)} projected for ${mlabel(m)} (CPA ${cpa(ta) ? money(cpa(ta)) : '—'}); ${esc(b.name)} runs at CPA ${cpa(tb) ? money(cpa(tb)) : '—'}.
-       Moving ${money(amt)} is estimated to change appointments by <b>${gain - lose >= 0 ? '+' : ''}${(gain - lose).toFixed(1)}</b> and bookings by <b>${bk >= 0 ? '+' : ''}${money(bk)}</b>.${amt > have ? ' <span class="down">That is more than the source campaign has projected.</span>' : ''}`;
-    $('#r-go').disabled = a.brand_id !== b.brand_id || a.id === b.id || amt <= 0 || amt > have;
-  };
-  if (!wide) { ['#r-from', '#r-to', '#r-month', '#r-amt'].forEach((s) => ($(s).oninput = preview)); preview(); }
-  if (!wide) $('#r-go').onclick = () => act(() => api('/api/reallocate', { from: Number($('#r-from').value), to: Number($('#r-to').value), month: $('#r-month').value, amount: Number($('#r-amt').value), location_id: state.location }), 'Spend moved');
+  if ($('#r-go')) {
+    const byId = (id) => rows.find((c) => String(c.id) === String(id));
+    const preview = () => {
+      const a = byId($('#r-from').value), b = byId($('#r-to').value), m = $('#r-month').value, amt = Number($('#r-amt').value) || 0;
+      if (!a || !b) return;
+      const ta = trail(a), tb = trail(b), cpa = (t) => (t.appts ? t.actual / t.appts : null), roas = (t) => (t.actual ? t.bookings / t.actual : null);
+      const lose = cpa(ta) ? amt / cpa(ta) : 0, gain = cpa(tb) ? amt / cpa(tb) : 0, bk = amt * ((roas(tb) || 0) - (roas(ta) || 0));
+      const have = a.m[m]?.projected || 0;
+      $('#r-prev').innerHTML = a.brand_id !== b.brand_id ? 'Pick two campaigns from the same brand.' :
+        `${esc(a.name)} has ${money(have)} projected for ${mlabel(m)} (CPA ${cpa(ta) ? money(cpa(ta)) : '—'}); ${esc(b.name)} runs at CPA ${cpa(tb) ? money(cpa(tb)) : '—'}.
+         Moving ${money(amt)} is estimated to change appointments by <b>${gain - lose >= 0 ? '+' : ''}${(gain - lose).toFixed(1)}</b> and bookings by <b>${bk >= 0 ? '+' : ''}${money(bk)}</b>.${amt > have ? ' <span class="down">That is more than the source campaign has projected.</span>' : ''}`;
+      $('#r-go').disabled = a.brand_id !== b.brand_id || a.id === b.id || amt <= 0 || amt > have;
+    };
+    ['#r-from', '#r-to', '#r-month', '#r-amt'].forEach((s) => ($(s).oninput = preview)); preview();
+    $('#r-go').onclick = () => act(() => api('/api/reallocate', { from: Number($('#r-from').value), to: Number($('#r-to').value), month: $('#r-month').value, amount: Number($('#r-amt').value), location_id: state.location }), 'Spend moved');
+  }
   $$('td.cell input', el).forEach((i) => {
     i.oninput = () => i.classList.toggle('dirty', i.value !== i.dataset.was);
     i.onkeydown = (e) => { if (e.key === 'Enter') i.blur(); };
-    i.onchange = () => { if (i.value === i.dataset.was) return; act(() => api('/api/projected', { campaign_id: Number(i.dataset.c), month: i.dataset.m, amount: Number(i.value), location_id: state.location }), 'Projection saved'); };
+    i.onchange = () => {
+      if (i.value === i.dataset.was) return;
+      if (i.dataset.ch) act(() => api('/api/channel-forecast', { brand_id: Number(state.brand), location_id: state.location, channel_id: Number(i.dataset.ch), month: i.dataset.m, amount: i.value === '' ? null : Number(i.value) }), i.value === '' ? 'Back to budget' : 'Channel forecast saved');
+      else act(() => api('/api/projected', { campaign_id: Number(i.dataset.c), month: i.dataset.m, amount: Number(i.value), location_id: state.location }), 'Projection saved');
+    };
   });
   if ($('#gl-month')) $('#gl-month').onchange = (e) => { state.glMonth = e.target.value; render(); };
 }
@@ -308,7 +392,7 @@ async function campaigns(el) {
 
 // ---- Mappings --------------------------------------------------------------
 async function mappings(el) {
-  const tabs = { names: 'CRM campaign names', hierarchy: 'Channel and Level 1', changes: 'Changes' };
+  const tabs = { names: 'CRM campaign names', links: 'Spend links', hierarchy: 'Channel and Level 1', brands: 'Brands and regions', changes: 'Changes' };
   let html = `<h1>Mappings</h1><p class="sub">Tie each CRM campaign name to one campaign, each campaign to a Level 1, and each Level 1 to a Channel.</p>
     <div class="tabs">${Object.entries(tabs).map(([k, n]) => `<button data-tab="${k}" class="${k === state.mapTab ? 'on' : ''}">${n}</button>`).join('')}</div>`;
   if (state.mapTab === 'names') {
@@ -333,6 +417,33 @@ async function mappings(el) {
         <td class="l muted">${c.suggest ? esc(c.suggest.why) : 'No suggestion'}</td><td class="l"><button class="primary" data-assign="${c.id}">Assign</button></td></tr>`).join('') || '<tr><td colspan="8" class="l muted">Every campaign has a Level 1.</td></tr>'}</table></div></div>
       <div class="card"><h2>Alternate spellings and CRM fixes</h2><div class="scroll"><table><tr><th>CRM campaign name</th><th class="l">Brand</th><th>Leads</th><th class="l">Outcome</th><th class="l"></th></tr>
       ${[...extra, ...fix].map((n) => `<tr><td>${esc(n.raw_name)}</td><td class="l">${esc(n.brand)}</td><td>${int(n.leads)}</td><td class="l">${n.status === 'mapped' ? `Mapped to ${esc(n.campaign)}` : 'Flagged to fix in the CRM'}</td><td class="l"><button class="link" data-reopen="${n.id}">Reopen</button></td></tr>`).join('') || '<tr><td colspan="5" class="l muted">None yet.</td></tr>'}</table></div></div>`;
+  } else if (state.mapTab === 'links') {
+    const rows = await api('/api/links?' + scope()), total = rows.reduce((a, r) => a + r.spend, 0);
+    const by = (s) => rows.filter((r) => r.status === s), amt = (list) => list.reduce((a, r) => a + r.spend, 0);
+    const done = [...by('linked'), ...by('same name')], todo = [...by('suggested'), ...by('needs a pick'), ...by('no candidate')];
+    const crm = state.brand ? (await api('/api/campaigns?' + scope())).filter((c) => c.source === 'crm') : [];
+    const pick = (r) => `<select data-link-pick="${r.id}">${r.suggestions.length ? `<optgroup label="Suggested">${r.suggestions.map((s) => `<option value="${s.id}">${esc(s.name)} · ${int(s.leads)} leads</option>`).join('')}</optgroup>` : '<option value="">Choose…</option>'}${crm.length ? `<optgroup label="All CRM campaigns">${opts(crm.filter((c) => !r.suggestions.some((s) => s.id === c.id)))}</optgroup>` : ''}</select>`;
+    const chip = { suggested: 'approved', 'needs a pick': 'pending', 'no candidate': 'rejected', linked: 'live', 'same name': 'live' };
+    html += `<div class="tiles">
+      <div class="tile"><div class="k">Linked spend</div><div class="v">${total ? pct(amt(done) / total) : '—'}</div><div class="d">${compact(amt(done))} of ${compact(total)} across ${done.length} campaigns</div></div>
+      <div class="tile"><div class="k">Ready to accept</div><div class="v">${by('suggested').length}</div><div class="d">${compact(amt(by('suggested')))}, one clear CRM match</div></div>
+      <div class="tile"><div class="k">Needs a pick</div><div class="v">${by('needs a pick').length}</div><div class="d">${compact(amt(by('needs a pick')))}, several CRM names fit</div></div>
+      <div class="tile"><div class="k">No candidate</div><div class="v">${by('no candidate').length}</div><div class="d">${compact(amt(by('no candidate')))}, leads use another name</div></div></div>
+      <div class="card"><div class="row" style="justify-content:space-between"><div><h2>Ad-platform campaigns to link</h2><p class="sub">Sorted by spend, full year. Linking moves a campaign's spend onto the CRM campaign in Insights; several ad campaigns can share one CRM campaign.${state.brand ? '' : ' Pick a brand above to choose from all of its CRM campaigns.'}${todo.length > 150 ? ` Showing the top 150 of ${todo.length}.` : ''}</p></div>
+        <button class="primary" id="accept-links" ${by('suggested').length ? '' : 'disabled'}>Accept ${by('suggested').length} clear matches</button></div>
+      <div class="scroll"><table><tr><th>Ad-platform campaign</th><th class="l">Brand</th><th class="l">Platform</th><th class="l">Level 1</th><th>Spend</th><th class="l">Status</th><th class="l">CRM campaign</th><th class="l">Why</th><th class="l"></th></tr>
+      ${todo.slice(0, 150).map((r) => `<tr><td class="wrap">${esc(r.name)}</td><td class="l">${esc(r.brand)}</td><td class="l">${PLATFORM_NAME[r.source]}</td><td class="l">${esc(r.level1)}</td><td>${money(r.spend)}</td>
+        <td class="l"><span class="chip ${chip[r.status]}">${r.status}</span></td><td class="l">${pick(r)}</td><td class="l wrap muted">${esc(r.suggestions[0]?.why || 'No CRM campaign in this brand resembles it')}</td>
+        <td class="l"><button class="primary" data-link="${r.id}">Link</button></td></tr>`).join('') || '<tr><td colspan="9" class="l muted">Every ad-platform campaign is linked.</td></tr>'}</table></div></div>
+      <div class="card"><h2>Linked</h2><div class="scroll"><table><tr><th>Ad-platform campaign</th><th class="l">Brand</th><th class="l">Platform</th><th>Spend</th><th class="l">CRM campaign</th><th class="l"></th></tr>
+      ${done.slice(0, 300).map((r) => `<tr><td class="wrap">${esc(r.name)}</td><td class="l">${esc(r.brand)}</td><td class="l">${PLATFORM_NAME[r.source]}</td><td>${money(r.spend)}</td>
+        <td class="l">${r.status === 'linked' ? esc(r.linked_name) : 'Same name in the CRM'}</td><td class="l">${r.status === 'linked' ? `<button class="link" data-unlink="${r.id}">Unlink</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="6" class="l muted">Nothing linked yet.</td></tr>'}</table></div></div>`;
+  } else if (state.mapTab === 'brands') {
+    const list = [...meta.brands].sort((x, y) => x.region.localeCompare(y.region) || x.name.localeCompare(y.name));
+    html += `<div class="card"><h2>Brands and regions</h2><p class="sub">Each brand sits in one region, and the region sets its division (Canada, or US for every other region). These drive the Division and Region filters at the top of every screen.</p><div class="scroll"><table>
+      <tr><th>Brand</th><th class="l">Division</th><th class="l">Region</th><th class="l">Currency</th><th class="l">Ledger loaded</th><th>Market locations</th></tr>
+      ${list.map((b) => `<tr><td>${esc(b.name)}</td><td class="l">${b.division}</td><td class="l"><select data-region="${b.id}" aria-label="Region for ${esc(b.name)}">${meta.regions.concat(meta.regions.includes('Unassigned') ? [] : ['Unassigned']).map((r) => `<option ${r === b.region ? 'selected' : ''}>${r}</option>`).join('')}</select></td>
+        <td class="l">${b.currency}</td><td class="l">${b.in_ledger ? 'Yes' : 'No'}</td><td>${meta.locations.filter((l) => l.brand_id === b.id).length}</td></tr>`).join('')}</table></div></div>`;
   } else if (state.mapTab === 'hierarchy') {
     const all = state.brand ? (await api('/api/campaigns?' + scope())).filter((c) => c.status !== 'rejected') : [];
     html += `<div class="cols" style="margin-bottom:16px">${meta.channels.map((ch, i) => `<div class="card"><h2><i class="dot" style="background:${COLORS[i]}"></i>${esc(ch.name)}</h2><ul>
@@ -348,6 +459,10 @@ async function mappings(el) {
   $$('[data-tab]', el).forEach((b) => (b.onclick = () => { state.mapTab = b.dataset.tab; render(); }));
   $$('[data-map]', el).forEach((b) => (b.onclick = () => { const v = $(`[data-pick="${b.dataset.map}"]`).value; if (!v) return toast('Choose a campaign first', true); act(() => api('/api/mappings', { id: Number(b.dataset.map), campaign_id: Number(v) }), 'Name mapped'); }));
   $$('[data-assign]', el).forEach((b) => (b.onclick = () => { const v = $(`[data-un="${b.dataset.assign}"]`).value; if (!v) return toast('Choose a Level 1 first', true); act(() => api('/api/campaigns/level1', { id: Number(b.dataset.assign), level1_id: Number(v) }), 'Level 1 assigned'); }));
+  $$('[data-link]', el).forEach((b) => (b.onclick = () => { const v = $(`[data-link-pick="${b.dataset.link}"]`).value; if (!v) return toast('Choose a CRM campaign first', true); act(() => api('/api/links', { id: Number(b.dataset.link), crm_id: Number(v) }), 'Spend linked'); }));
+  $$('[data-unlink]', el).forEach((b) => (b.onclick = () => act(() => api('/api/links', { id: Number(b.dataset.unlink), crm_id: null }), 'Spend unlinked')));
+  if ($('#accept-links')) $('#accept-links').onclick = () => act(async () => { const r = await api('/api/links/accept', { brand: state.brand || null, region: state.region || null, division: state.division || null }); toast(`${r.linked} campaigns linked`); });
+  $$('[data-region]', el).forEach((s) => (s.onchange = () => act(async () => { await api('/api/brands/region', { id: Number(s.dataset.region), region: s.value }); await loadMeta(); }, 'Region updated')));
   $$('[data-fix]', el).forEach((b) => (b.onclick = () => act(() => api('/api/mappings', { id: Number(b.dataset.fix), status: 'fix_in_crm' }), 'Flagged to fix in the CRM')));
   $$('[data-reopen]', el).forEach((b) => (b.onclick = () => act(() => api('/api/mappings', { id: Number(b.dataset.reopen) }), 'Name reopened')));
   $$('[data-l1]', el).forEach((s) => (s.onchange = () => act(async () => { await api('/api/level1', { id: Number(s.dataset.l1), channel_id: Number(s.value) }); meta = await api('/api/meta'); }, 'Level 1 moved')));
@@ -380,25 +495,46 @@ async function render() {
   $$('#nav a').forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#' + name));
   try { await VIEWS[name]($('#view')); } catch (e) { $('#view').innerHTML = `<div class="card">Could not load this screen: ${esc(e.message)}</div>`; }
 }
-function fillLocations() {
-  $('#f-location').innerHTML = '<option value="">All locations</option>' + opts(meta.locations.filter((l) => !state.brand || String(l.brand_id) === state.brand), state.location, (l) => (state.brand ? l.name : `${l.name} · ${brandCode(l.brand_id)}`));
+// Division → Region → Brand → Market location: each choice narrows the lists after it.
+const divisionOfRegion = (r) => (r === 'Canada' ? 'Canada' : 'US');
+const inEntityScope = (b) => (!state.division || b.division === state.division) && (!state.region || b.region === state.region);
+function fillFilters() {
+  const pick = (id, all, list, sel) => ($(id).innerHTML = `<option value="">${all}</option>` + list.map((x) => `<option ${x === sel ? 'selected' : ''}>${esc(x)}</option>`).join(''));
+  pick('#f-division', 'All divisions', meta.divisions, state.division);
+  pick('#f-region', 'All regions', meta.regions.filter((r) => !state.division || divisionOfRegion(r) === state.division), state.region);
+  const brands = meta.brands.filter(inEntityScope).sort((a, b) => a.name.localeCompare(b.name)), ids = new Set(brands.map((b) => b.id));
+  $('#f-brand').innerHTML = '<option value="">All brands</option>' + opts(brands, state.brand);
+  $('#f-location').innerHTML = '<option value="">All locations</option>' + opts(meta.locations.filter((l) => (state.brand ? String(l.brand_id) === state.brand : ids.has(l.brand_id))), state.location, (l) => (state.brand ? l.name : `${l.name} · ${brandCode(l.brand_id)}`));
 }
 async function loadMeta() {
   meta = await api('/api/meta');
-  if (!meta.brands.some((b) => String(b.id) === state.brand)) { state.brand = ''; state.location = ''; }
+  if (!meta.regions.includes(state.region)) state.region = '';
+  if (!meta.brands.some((b) => String(b.id) === state.brand && inEntityScope(b))) { state.brand = ''; state.location = ''; }
+  if (!meta.years.includes(state.year)) state.year = meta.closedThrough.slice(0, 4);
+  $('#f-year').innerHTML = meta.years.map((y) => `<option ${y === state.year ? 'selected' : ''}>${y}</option>`).join('');
   $('.tag').textContent = meta.mode === 'real' ? 'Prototype · imported data' : 'Prototype · synthetic data';
-  $('#f-brand').innerHTML = '<option value="">All brands</option>' + opts([...meta.brands].sort((a, b) => a.name.localeCompare(b.name)), state.brand);
-  fillLocations();
+  fillFilters();
 }
 async function init() {
   await loadMeta();
-  $('#f-brand').onchange = (e) => { state.brand = e.target.value; state.location = ''; fillLocations(); render(); };
+  const narrowed = () => { state.brand = ''; state.location = ''; fillFilters(); render(); };
+  $('#f-division').onchange = (e) => { state.division = e.target.value; if (state.region && state.division && divisionOfRegion(state.region) !== state.division) state.region = ''; narrowed(); };
+  $('#f-region').onchange = (e) => { state.region = e.target.value; if (state.region) state.division = divisionOfRegion(state.region); narrowed(); };
+  $('#f-brand').onchange = (e) => { state.brand = e.target.value; state.location = ''; fillFilters(); render(); };
   $('#f-location').onchange = (e) => {
     state.location = e.target.value;
-    if (state.location && !state.brand) { state.brand = String(meta.locations.find((l) => String(l.id) === state.location).brand_id); $('#f-brand').value = state.brand; fillLocations(); }
-    render();
+    if (state.location && !state.brand) state.brand = String(meta.locations.find((l) => String(l.id) === state.location).brand_id);
+    fillFilters(); render();
   };
+  $('#f-year').onchange = (e) => { state.year = e.target.value; render(); };
   $('#role').onchange = (e) => { state.role = e.target.value; render(); };
+  const paintCur = () => {
+    $$('#cur button').forEach((b) => b.classList.toggle('on', b.dataset.cur === state.cur));
+    const cad = meta.brands.filter((b) => b.currency === 'CAD').map((b) => b.name), other = state.cur === 'CAD' ? 'US-dollar' : 'Canadian-dollar';
+    $('#fxnote').textContent = `Amounts in ${state.cur}. ` + (state.cur === 'USD' && !cad.length ? '' : `${other[0].toUpperCase() + other.slice(1)} brands${state.cur === 'USD' ? ` (${cad.join(', ')})` : ''} are translated at 1 CAD = ${meta.fx.toFixed(2)} USD.`);
+  };
+  $$('#cur button').forEach((b) => (b.onclick = () => { state.cur = b.dataset.cur; try { localStorage.setItem('maestro-currency', state.cur); } catch { /* private window */ } paintCur(); render(); }));
+  paintCur();
   window.onhashchange = render;
   render();
 }

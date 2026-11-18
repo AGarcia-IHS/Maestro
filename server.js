@@ -3,7 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openDb, MONTHS, CLOSED_THROUGH, getMode } from './db.js';
+import { openDb, MONTHS, YEARS, CLOSED_THROUGH, FX_CAD_USD, REGIONS, divisionOf, getMode } from './db.js';
 import { listFolder, runImport } from './lib/importers.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
@@ -12,6 +12,25 @@ const db = openDb();
 const q = (sql) => db.prepare(sql);
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
 const OPEN_MONTHS = MONTHS.filter((m) => m > CLOSED_THROUGH);
+
+// Display currency of the request being handled. Handlers run synchronously, so one module-level value is safe.
+let CUR = 'USD';
+// Amounts are stored in each brand's own currency; these turn stored amounts into the display currency.
+const fxSql = (b) => `(CASE WHEN ${b}.currency = '${CUR}' THEN 1.0 WHEN ${b}.currency = 'CAD' THEN ${FX_CAD_USD} ELSE ${1 / FX_CAD_USD} END)`;
+const fxOf = (brandId) => { const c = q('SELECT currency FROM brand WHERE id = ?').get(brandId)?.currency || 'USD'; return c === CUR ? 1 : c === 'CAD' ? FX_CAD_USD : 1 / FX_CAD_USD; };
+const fxOfCampaign = (id) => fxOf(q('SELECT brand_id FROM campaign WHERE id = ?').get(id)?.brand_id);
+const sym = () => (CUR === 'CAD' ? 'CA$' : '$');
+// CRM contract amounts in the golden record are in USD for every brand, Canadian ones included.
+const usdFx = () => (CUR === 'USD' ? 1 : 1 / FX_CAD_USD);
+
+// Entity scope of the request being handled: the brand ids selected by Division / Region / Brand, or null for everything.
+let SCOPE = null;
+const inScope = (col) => (SCOPE ? `${col} IN (${SCOPE.join(',') || 0})` : '1=1');
+function scopeOf(o) {
+  if (num(o.brand)) return [num(o.brand)];
+  if (!o.region && !o.division) return null;
+  return q('SELECT id, region FROM brand').all().filter((b) => (!o.region || b.region === o.region) && (!o.division || divisionOf(b.region) === o.division)).map((b) => b.id);
+}
 
 class Bad extends Error {}
 const need = (cond, msg) => { if (!cond) throw new Bad(msg); };
@@ -53,7 +72,7 @@ function setProjected(campaignId, month, amount, locationId) {
   need(OPEN_MONTHS.includes(month), 'Only open months can be re-forecast');
   need(Number.isFinite(amount) && amount >= 0, 'Amount must be zero or more');
   const locs = campaignLocations(campaignId, locationId);
-  const weights = locs.map((l) => q('SELECT budget FROM spend WHERE campaign_id = ? AND location_id = ? AND month = ?').get(campaignId, l, month)?.budget || 0);
+  const weights = locs.map((l) => { const s = q('SELECT budget, projected FROM spend WHERE campaign_id = ? AND location_id = ? AND month = ?').get(campaignId, l, month); return s?.projected || s?.budget || 0; });
   const total = weights.reduce((a, b) => a + b, 0);
   let left = Math.round(amount);
   locs.forEach((l, i) => {
@@ -64,59 +83,139 @@ function setProjected(campaignId, month, amount, locationId) {
   });
 }
 
+// ---- spend links ------------------------------------------------------------
+const PLATFORMS = ['google_ads', 'bing_ads', 'meta_ads', 'active_prospect'];
+// Words in a CRM campaign name that point at a platform, and words that rule it out.
+function platformHint(source, level1) {
+  if (/^lsa$|local service/i.test(level1)) return { yes: /\blsa\b|local service/i };
+  if (source === 'google_ads') return { yes: /google|adwords|ppc|pay per click/i, no: /\blsa\b|local service|my business|\bgmb\b|organic|maps/i };
+  if (source === 'bing_ads') return { yes: /bing|microsoft/i };
+  if (source === 'meta_ads') return { yes: /facebook|\bmeta\b|instagram|\bfb\b/i, no: /organic/i };
+  return {};
+}
+// Every ad-platform campaign with its spend, its current link and ranked CRM candidates from the same brand.
+function linkRows() {
+  const marks = PLATFORMS.map(() => '?').join(',');
+  const rows = q(`SELECT c.id, c.name, c.brand_id, b.name brand, c.source, c.level1_id, l.name level1, c.linked_to, t.name linked_name,
+                         COALESCE((SELECT SUM(s.actual) FROM spend s WHERE s.campaign_id = c.id), 0) spend,
+                         COALESCE((SELECT SUM(f.leads) FROM crm_name n JOIN crm_fact f ON f.crm_name_id = n.id WHERE n.campaign_id = c.id), 0) own_leads
+                  FROM campaign c JOIN brand b ON b.id = c.brand_id JOIN level1 l ON l.id = c.level1_id LEFT JOIN campaign t ON t.id = c.linked_to
+                  WHERE c.source IN (${marks}) AND ${inScope('c.brand_id')} ORDER BY spend DESC`).all(...PLATFORMS);
+  const crm = {};
+  for (const c of q(`SELECT c.id, c.brand_id, c.name, c.level1_id, l.name level1,
+                            COALESCE((SELECT SUM(f.leads) FROM crm_name n JOIN crm_fact f ON f.crm_name_id = n.id WHERE n.campaign_id = c.id), 0) leads
+                     FROM campaign c JOIN level1 l ON l.id = c.level1_id WHERE c.source = 'crm' AND ${inScope('c.brand_id')}`).all()) (crm[c.brand_id] ||= []).push(c);
+  for (const r of rows) {
+    r.spend *= fxOf(r.brand_id);
+    const hint = platformHint(r.source, r.level1), pool = crm[r.brand_id] || [], maxLeads = Math.max(1, ...pool.map((c) => c.leads));
+    r.suggestions = pool.map((c) => {
+      const sameL1 = c.level1_id === r.level1_id, named = hint.yes?.test(c.name), ruledOut = hint.no?.test(c.name), sim = similarity(r.name, c.name);
+      // A CRM campaign nobody has given a Level 1 yet is neither for nor against; one with no leads this year is unlikely.
+      const score = (sameL1 ? 0.45 : c.level1 === '(Unspecified)' ? 0.25 : 0) - (c.leads > 0 ? 0 : 0.15) + (named ? 0.35 : 0) - (ruledOut ? 0.3 : 0) + sim * (hint.yes ? 0.2 : 0.7) + 0.05 * (c.leads / maxLeads);
+      const why = [sameL1 && `same Level 1 (${c.level1})`, named && 'name points at this platform', sim >= 0.5 && `${Math.round(sim * 100)}% name match`].filter(Boolean).join(', ');
+      return { id: c.id, name: c.name, leads: c.leads, level1: c.level1, score: Math.round(score * 100) / 100, why };
+    }).filter((s) => s.score >= 0.45).sort((a, b) => b.score - a.score).slice(0, 5);
+    const [a, b2] = r.suggestions;
+    r.status = r.linked_to ? 'linked' : r.own_leads > 0 ? 'same name' : !a ? 'no candidate' : a.score >= 0.75 && (!b2 || a.score - b2.score >= 0.1) ? 'suggested' : 'needs a pick';
+  }
+  return rows;
+}
+
 // ---- API -------------------------------------------------------------------
 const routes = {
   'GET /api/meta': () => ({
-    brands: q('SELECT * FROM brand ORDER BY id').all(),
+    brands: q('SELECT b.*, EXISTS (SELECT 1 FROM gl g WHERE g.brand_id = b.id) in_ledger FROM brand b ORDER BY b.id').all().map((b) => ({ ...b, division: divisionOf(b.region) })),
+    regions: [...REGIONS, ...(q("SELECT 1 FROM brand WHERE region = 'Unassigned'").get() ? ['Unassigned'] : [])], divisions: ['US', 'Canada'],
     locations: q('SELECT * FROM location ORDER BY id').all(),
     channels: q('SELECT * FROM channel ORDER BY sort').all(),
     level1: q('SELECT * FROM level1 ORDER BY id').all(),
-    months: MONTHS, closedThrough: CLOSED_THROUGH, mode: getMode(db),
+    months: MONTHS, years: YEARS.map(String), closedThrough: CLOSED_THROUGH, mode: getMode(db), fx: FX_CAD_USD,
+    feedStart: JSON.parse(q("SELECT value FROM setting WHERE key = 'feed_start'").get()?.value || '{}'),
   }),
 
   'GET /api/facts': ({ query }) => {
-    const p = { brand: num(query.brand), location: num(query.location) };
+    const p = { location: num(query.location) };
     return {
-      campaigns: q('SELECT id, brand_id, level1_id, name, vendor, source, status FROM campaign WHERE (:brand IS NULL OR brand_id = :brand)').all({ brand: p.brand }),
-      spend: q(`SELECT s.campaign_id, s.month, SUM(s.budget) budget, SUM(s.actual) actual, SUM(s.projected) projected
-                FROM spend s JOIN location l ON l.id = s.location_id
-                WHERE (:brand IS NULL OR l.brand_id = :brand) AND (:location IS NULL OR l.id = :location)
+      campaigns: q(`SELECT id, brand_id, level1_id, name, vendor, source, status, linked_to FROM campaign WHERE ${inScope('brand_id')}`).all(),
+      spend: q(`SELECT s.campaign_id, s.month, SUM(s.budget * ${fxSql('b')}) budget, SUM(s.actual * ${fxSql('b')}) actual, SUM(s.projected * ${fxSql('b')}) projected
+                FROM spend s JOIN location l ON l.id = s.location_id JOIN brand b ON b.id = l.brand_id
+                WHERE ${inScope('l.brand_id')} AND (:location IS NULL OR l.id = :location)
                 GROUP BY s.campaign_id, s.month`).all(p),
-      crm: q(`SELECT n.campaign_id, f.month, SUM(f.leads) leads, SUM(f.appts) appts, SUM(f.sales) sales, SUM(f.bookings) bookings
+      crm: q(`SELECT n.campaign_id, f.month, SUM(f.leads) leads, SUM(f.appts) appts, SUM(f.sales) sales, SUM(f.bookings) * ${usdFx()} bookings
               FROM crm_fact f JOIN crm_name n ON n.id = f.crm_name_id JOIN location l ON l.id = f.location_id
-              WHERE (:brand IS NULL OR l.brand_id = :brand) AND (:location IS NULL OR l.id = :location)
+              WHERE ${inScope('l.brand_id')} AND (:location IS NULL OR l.id = :location)
               GROUP BY n.campaign_id, f.month`).all(p),
-      gl: q('SELECT month, level1_id, SUM(amount) amount FROM gl WHERE (:brand IS NULL OR brand_id = :brand) AND (:location IS NULL OR location_id = :location) GROUP BY month, level1_id').all(p),
+      // Budget and channel re-forecast by brand, channel and month. "eff" is the forecast where one was entered, else the budget.
+      plan: q(`SELECT p.brand_id, p.channel_id, p.month, SUM(p.budget * ${fxSql('b')}) budget, SUM(COALESCE(p.forecast, p.budget) * ${fxSql('b')}) eff, COUNT(p.forecast) n
+                FROM channel_plan p JOIN brand b ON b.id = p.brand_id
+                WHERE ${inScope('p.brand_id')} AND (:location IS NULL OR p.location_id = :location)
+                GROUP BY p.brand_id, p.channel_id, p.month`).all(p),
+      gl: q(`SELECT g.month, g.level1_id, SUM(g.amount * ${fxSql('b')}) amount FROM gl g JOIN brand b ON b.id = g.brand_id WHERE ${inScope('g.brand_id')} AND (:location IS NULL OR g.location_id = :location) GROUP BY g.month, g.level1_id`).all(p),
     };
   },
 
   'POST /api/projected': ({ body, user }) => tx(() => {
-    const before = projectedTotal(body.campaign_id, body.month, campaignLocations(body.campaign_id, num(body.location_id)));
-    setProjected(body.campaign_id, body.month, Number(body.amount), num(body.location_id));
+    const fx = fxOfCampaign(body.campaign_id); // amounts arrive in the display currency and are stored in the brand's own
+    const before = projectedTotal(body.campaign_id, body.month, campaignLocations(body.campaign_id, num(body.location_id))) * fx;
+    setProjected(body.campaign_id, body.month, Number(body.amount) / fx, num(body.location_id));
     const c = q('SELECT name FROM campaign WHERE id = ?').get(body.campaign_id);
-    audit(user, 'reforecast', `${c.name} ${body.month}: $${Math.round(before)} → $${Math.round(body.amount)}`);
+    audit(user, 'reforecast', `${c.name} ${body.month}: ${sym()}${Math.round(before)} → ${sym()}${Math.round(body.amount)}`);
+    return { ok: true };
+  }),
+
+  // Monthly channel re-forecast. With only a brand chosen the amount is spread across its market locations
+  // in proportion to budget; an empty amount clears the re-forecast and the month falls back to budget.
+  'POST /api/channel-forecast': ({ body, user }) => tx(() => {
+    const brand = q('SELECT * FROM brand WHERE id = ?').get(num(body.brand_id)), ch = q('SELECT * FROM channel WHERE id = ?').get(num(body.channel_id)), loc = num(body.location_id);
+    need(brand && ch, 'Pick a brand to re-forecast a channel');
+    need(OPEN_MONTHS.includes(body.month), 'Only open months can be re-forecast');
+    const cleared = body.amount === null || body.amount === '';
+    if (cleared) {
+      q('UPDATE channel_plan SET forecast = NULL WHERE brand_id = ? AND channel_id = ? AND month = ? AND (? IS NULL OR location_id = ?)').run(brand.id, ch.id, body.month, loc, loc);
+      audit(user, 'channel re-forecast cleared', `${brand.name} · ${ch.name} · ${body.month}`);
+      return { ok: true };
+    }
+    const amount = Number(body.amount) / fxOf(brand.id);
+    need(Number.isFinite(amount) && amount >= 0, 'Amount must be zero or more');
+    const up = q('INSERT INTO channel_plan (month, brand_id, location_id, channel_id, budget, forecast) VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT (month, location_id, channel_id) DO UPDATE SET forecast = excluded.forecast');
+    if (loc) up.run(body.month, brand.id, loc, ch.id, Math.round(amount));
+    else {
+      const rows = q('SELECT location_id, budget FROM channel_plan WHERE brand_id = ? AND channel_id = ? AND month = ?').all(brand.id, ch.id, body.month);
+      let targets = rows.filter((r) => r.budget > 0).map((r) => ({ id: r.location_id, w: r.budget }));
+      if (!targets.length) {
+        // No budget to follow: use the locations that carry this channel's campaign spend, else the brand's first location.
+        targets = q(`SELECT s.location_id id, SUM(s.projected) + 1 w FROM spend s JOIN campaign c ON c.id = s.campaign_id JOIN level1 l ON l.id = c.level1_id
+                     WHERE c.brand_id = ? AND l.channel_id = ? AND s.month = ? GROUP BY s.location_id`).all(brand.id, ch.id, body.month);
+        if (!targets.length) targets = [{ id: q('SELECT id FROM location WHERE brand_id = ? ORDER BY id').get(brand.id).id, w: 1 }];
+      }
+      q('UPDATE channel_plan SET forecast = 0 WHERE brand_id = ? AND channel_id = ? AND month = ?').run(brand.id, ch.id, body.month);
+      const total = targets.reduce((a, t) => a + t.w, 0); let left = Math.round(amount);
+      targets.forEach((t, i) => { const share = i === targets.length - 1 ? left : Math.round(amount * (t.w / total)); left -= share; up.run(body.month, brand.id, t.id, ch.id, share); });
+    }
+    audit(user, 'channel re-forecast', `${brand.name} · ${ch.name} · ${body.month}: ${sym()}${Math.round(body.amount).toLocaleString()}`);
     return { ok: true };
   }),
 
   'POST /api/reallocate': ({ body, user }) => tx(() => {
-    const amount = Number(body.amount), loc = num(body.location_id);
+    const fx = fxOfCampaign(body.from), amount = Number(body.amount) / fx, loc = num(body.location_id);
     need(body.from !== body.to, 'Pick two different campaigns');
     need(amount > 0, 'Amount must be more than zero');
     const brandOf = (id) => q('SELECT brand_id FROM campaign WHERE id = ?').get(id)?.brand_id;
     need(brandOf(body.from) && brandOf(body.from) === brandOf(body.to), 'Both campaigns must belong to the same brand');
     const fromNow = projectedTotal(body.from, body.month, campaignLocations(body.from, loc));
     const toNow = projectedTotal(body.to, body.month, campaignLocations(body.to, loc));
-    need(amount <= fromNow, `Only $${Math.round(fromNow)} is projected on the source campaign for that month`);
+    need(amount <= fromNow + 0.5, `Only ${sym()}${Math.round(fromNow * fx)} is projected on the source campaign for that month`);
     setProjected(body.from, body.month, fromNow - amount, loc);
     setProjected(body.to, body.month, toNow + amount, loc);
     const name = (id) => q('SELECT name FROM campaign WHERE id = ?').get(id).name;
-    audit(user, 'reallocate', `${body.month}: moved $${Math.round(amount)} from ${name(body.from)} to ${name(body.to)}`);
+    audit(user, 'reallocate', `${body.month}: moved ${sym()}${Math.round(amount * fx)} from ${name(body.from)} to ${name(body.to)}`);
     return { ok: true };
   }),
 
   'GET /api/campaigns': ({ query }) =>
     q(`SELECT c.*, b.name brand, l.name level1 FROM campaign c JOIN brand b ON b.id = c.brand_id JOIN level1 l ON l.id = c.level1_id
-       WHERE (:brand IS NULL OR c.brand_id = :brand) ORDER BY CASE c.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END, c.id DESC`).all({ brand: num(query.brand) }),
+       WHERE ${inScope('c.brand_id')} ORDER BY CASE c.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END, c.id DESC`).all()
+      .map((c) => { const fx = fxOf(c.brand_id); return { ...c, monthly_spend: (c.monthly_spend || 0) * fx, exp_bookings: (c.exp_bookings || 0) * fx }; }),
 
   'POST /api/campaigns': ({ body, user }) => tx(() => {
     const brand = q('SELECT * FROM brand WHERE id = ?').get(body.brand_id);
@@ -130,8 +229,8 @@ const routes = {
     need(!q('SELECT 1 FROM campaign WHERE brand_id = ? AND lower(name) = lower(?)').get(brand.id, name), `A campaign named ${name} already exists`);
     const id = q(`INSERT INTO campaign (brand_id, level1_id, name, vendor, source, status, start_month, end_month, monthly_spend, exp_appts, exp_bookings, location_ids, landing_url, created_by, created_at)
                   VALUES (?, ?, ?, ?, 'manual', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(brand.id, l1.id, name, body.vendor || null, body.start_month, body.end_month, Number(body.monthly_spend) || 0, Number(body.exp_appts) || 0,
-        Number(body.exp_bookings) || 0, JSON.stringify(body.location_ids.map(Number)), body.landing_url || null, user, new Date().toISOString()).lastInsertRowid;
+      .run(brand.id, l1.id, name, body.vendor || null, body.start_month, body.end_month, (Number(body.monthly_spend) || 0) / fxOf(brand.id), Number(body.exp_appts) || 0,
+        (Number(body.exp_bookings) || 0) / fxOf(brand.id), JSON.stringify(body.location_ids.map(Number)), body.landing_url || null, user, new Date().toISOString()).lastInsertRowid;
     audit(user, 'campaign requested', name);
     return { id, name };
   }),
@@ -163,11 +262,10 @@ const routes = {
   }),
 
   'GET /api/mappings': ({ query }) => {
-    const brand = num(query.brand);
     const names = q(`SELECT n.id, n.brand_id, b.name brand, n.raw_name, n.campaign_id, n.status, n.first_seen, c.name campaign,
                             COALESCE(SUM(f.leads), 0) leads, COALESCE(SUM(f.bookings), 0) bookings
                      FROM crm_name n JOIN brand b ON b.id = n.brand_id LEFT JOIN campaign c ON c.id = n.campaign_id LEFT JOIN crm_fact f ON f.crm_name_id = n.id
-                     WHERE (:brand IS NULL OR n.brand_id = :brand) GROUP BY n.id ORDER BY leads DESC`).all({ brand });
+                     WHERE ${inScope('n.brand_id')} GROUP BY n.id ORDER BY leads DESC`).all();
     const byBrand = {};
     for (const c of q("SELECT id, brand_id, name FROM campaign WHERE status IN ('live', 'approved')").all()) (byBrand[c.brand_id] ||= []).push(c);
     for (const n of names) {
@@ -175,6 +273,7 @@ const routes = {
       n.suggestions = (byBrand[n.brand_id] || []).map((c) => ({ id: c.id, name: c.name, confidence: Math.round(similarity(n.raw_name, c.name) * 100) }))
         .filter((s) => s.confidence >= 40).sort((a, b) => b.confidence - a.confidence).slice(0, 3);
     }
+    for (const n of names) n.bookings *= usdFx();
     return names;
   },
 
@@ -223,7 +322,7 @@ const routes = {
                       COALESCE((SELECT SUM(f.bookings) FROM crm_name n JOIN crm_fact f ON f.crm_name_id = n.id WHERE n.campaign_id = c.id), 0) bookings,
                       COALESCE((SELECT SUM(s.actual) FROM spend s WHERE s.campaign_id = c.id), 0) spend
                     FROM campaign c JOIN brand b ON b.id = c.brand_id
-                    WHERE c.level1_id = :un AND (:brand IS NULL OR c.brand_id = :brand) ORDER BY leads + spend DESC`).all({ un: un.id, brand: num(query.brand) });
+                    WHERE c.level1_id = :un AND ${inScope('c.brand_id')} ORDER BY leads + spend DESC`).all({ un: un.id });
     const votes = new Map();
     for (const c of q('SELECT name, level1_id FROM campaign WHERE level1_id <> ?').all(un.id)) {
       const m = votes.get(norm(c.name)) || votes.set(norm(c.name), new Map()).get(norm(c.name));
@@ -236,6 +335,7 @@ const routes = {
       const best = l1s.map((l) => ({ id: l.id, s: similarity(l.name, r.name) })).sort((a, b) => b.s - a.s)[0];
       if (best && best.s >= 0.8) r.suggest = { id: best.id, why: `${Math.round(best.s * 100)}% name match` };
     }
+    for (const r of rows) { const fx = fxOf(r.brand_id); r.bookings *= usdFx(); r.spend *= fx; }
     return rows;
   },
 
@@ -257,6 +357,35 @@ const routes = {
     try { return runImport(db, path.join(dir, body.name), user); } catch (e) { throw new Bad(e.message); }
   },
 
+  // ---- spend links: which CRM campaign an ad-platform campaign's spend belongs to ----
+  'GET /api/links': () => linkRows(),
+
+  'POST /api/links': ({ body, user }) => tx(() => {
+    const p = q('SELECT * FROM campaign WHERE id = ?').get(body.id);
+    need(p && PLATFORMS.includes(p.source), 'Only ad-platform campaigns can be linked');
+    if (!body.crm_id) { q('UPDATE campaign SET linked_to = NULL WHERE id = ?').run(p.id); audit(user, 'unlinked spend', p.name); return { ok: true }; }
+    const c = q("SELECT * FROM campaign WHERE id = ? AND brand_id = ? AND source = 'crm'").get(body.crm_id, p.brand_id);
+    need(c, 'Pick a CRM campaign from the same brand');
+    q('UPDATE campaign SET linked_to = ? WHERE id = ?').run(c.id, p.id);
+    audit(user, 'linked spend', `${p.name} → ${c.name}`);
+    return { ok: true };
+  }),
+
+  'POST /api/links/accept': ({ body, user }) => tx(() => {
+    const ready = linkRows().filter((r) => r.status === 'suggested');
+    for (const r of ready) q('UPDATE campaign SET linked_to = ? WHERE id = ?').run(r.suggestions[0].id, r.id);
+    if (ready.length) audit(user, 'accepted suggested spend links', `${ready.length} ad-platform campaigns linked`);
+    return { linked: ready.length };
+  }),
+
+  'POST /api/brands/region': ({ body, user }) => tx(() => {
+    const b = q('SELECT * FROM brand WHERE id = ?').get(num(body.id));
+    need(b && (REGIONS.includes(body.region) || body.region === 'Unassigned'), 'Pick a brand and one of the listed regions');
+    q('UPDATE brand SET region = ? WHERE id = ?').run(body.region, b.id);
+    audit(user, 'moved brand to region', `${b.name} → ${body.region} (${divisionOf(body.region)})`);
+    return { ok: true };
+  }),
+
   'GET /api/audit': () => q('SELECT * FROM audit ORDER BY id DESC LIMIT 200').all(),
 };
 
@@ -275,6 +404,8 @@ http.createServer(async (req, res) => {
   if (handler) {
     try {
       const body = req.method === 'POST' ? await readBody(req) : {};
+      CUR = req.headers['x-maestro-currency'] === 'CAD' ? 'CAD' : 'USD';
+      SCOPE = scopeOf({ ...Object.fromEntries(url.searchParams), ...(req.method === 'POST' ? { brand: body.brand, region: body.region, division: body.division } : {}) });
       const result = handler({ query: Object.fromEntries(url.searchParams), body, user: req.headers['x-maestro-user'] || 'Demo user', role: req.headers['x-maestro-role'] || 'marketer' });
       send(200, JSON.stringify(result));
     } catch (e) {
