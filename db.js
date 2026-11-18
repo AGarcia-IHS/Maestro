@@ -217,7 +217,7 @@ function seed(db) {
   ins('INSERT INTO audit (at, user, action, detail) VALUES (?, ?, ?, ?)').run(new Date().toISOString(), 'system', 'seed', 'Synthetic pilot data generated');
 }
 
-const TABLES = ['record', 'gl_line', 'spend_day', 'crm_day', 'channel_plan', 'crm_fact', 'crm_name', 'spend', 'gl', 'gl_map', 'entity', 'campaign', 'level1', 'channel', 'location', 'brand'];
+const TABLES = ['budget_l1', 'proj_channel', 'proj_campaign', 'record', 'gl_line', 'spend_day', 'crm_day', 'channel_plan', 'crm_fact', 'crm_name', 'spend', 'gl', 'gl_map', 'entity', 'campaign', 'level1', 'channel', 'location', 'brand'];
 export const wipe = (db) => { for (const t of TABLES) db.exec('DELETE FROM ' + t); };
 export const getMode = (db) => db.prepare("SELECT value FROM setting WHERE key = 'mode'").get()?.value || 'synthetic';
 export const setMode = (db, mode) => db.prepare("INSERT INTO setting (key, value) VALUES ('mode', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(mode);
@@ -229,6 +229,10 @@ const DAY_DDL = `CREATE TABLE IF NOT EXISTS spend_day (campaign_id INTEGER NOT N
 CREATE INDEX IF NOT EXISTS spend_day_day ON spend_day (day);
 CREATE TABLE IF NOT EXISTS crm_day (crm_name_id INTEGER NOT NULL, location_id INTEGER NOT NULL, day TEXT NOT NULL, leads REAL NOT NULL DEFAULT 0, appts REAL NOT NULL DEFAULT 0, sales REAL NOT NULL DEFAULT 0, bookings REAL NOT NULL DEFAULT 0, PRIMARY KEY (crm_name_id, location_id, day));
 CREATE INDEX IF NOT EXISTS crm_day_day ON crm_day (day);
+CREATE TABLE IF NOT EXISTS budget_l1 (month TEXT NOT NULL, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, level1_id INTEGER NOT NULL, measure TEXT NOT NULL, amount REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS budget_l1_month ON budget_l1 (month);
+CREATE TABLE IF NOT EXISTS proj_channel (month TEXT NOT NULL, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, measure TEXT NOT NULL, amount REAL NOT NULL, PRIMARY KEY (month, location_id, channel_id, measure));
+CREATE TABLE IF NOT EXISTS proj_campaign (month TEXT NOT NULL, campaign_id INTEGER NOT NULL, location_id INTEGER NOT NULL, measure TEXT NOT NULL, amount REAL NOT NULL, PRIMARY KEY (month, campaign_id, location_id, measure));
 CREATE TABLE IF NOT EXISTS record (id TEXT, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, campaign_id INTEGER, service TEXT, ctype TEXT, status TEXT,
   clone INTEGER NOT NULL, won INTEGER NOT NULL, lead_day TEXT, appt_day TEXT, closed_day TEXT, amount REAL NOT NULL DEFAULT 0, rep TEXT);
 CREATE INDEX IF NOT EXISTS record_lead ON record (lead_day);
@@ -273,6 +277,14 @@ export function openDb({ reset = false } = {}) {
 );`);
   if (!db.prepare('PRAGMA table_info(brand)').all().some((c) => c.name === 'region')) db.exec('ALTER TABLE brand ADD COLUMN region TEXT');
   assignRegions(db);
+  // Projections were first held by brand; they are now held by market location. Anything entered at brand level moves to the brand's first location.
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'proj_channel'").get() && !db.prepare('PRAGMA table_info(proj_channel)').all().some((c) => c.name === 'location_id')) {
+    db.exec('ALTER TABLE proj_channel RENAME TO proj_channel_old; ALTER TABLE proj_campaign RENAME TO proj_campaign_old;');
+    db.exec(DAY_DDL);
+    db.exec(`INSERT INTO proj_channel SELECT o.month, o.brand_id, (SELECT MIN(id) FROM location WHERE brand_id = o.brand_id), o.channel_id, o.measure, o.amount FROM proj_channel_old o;
+             INSERT INTO proj_campaign SELECT o.month, o.campaign_id, (SELECT MIN(l.id) FROM location l JOIN campaign c ON c.brand_id = l.brand_id WHERE c.id = o.campaign_id), o.measure, o.amount FROM proj_campaign_old o;
+             DROP TABLE proj_channel_old; DROP TABLE proj_campaign_old;`);
+  }
   db.exec(DAY_DDL);
   if (!db.prepare('SELECT 1 FROM cal WHERE day = ?').get(MONTHS[0] + '-01')) buildCal(db); // also rebuilds when the span of years changes
   // Databases created before spend links existed get the column added in place.

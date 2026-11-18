@@ -17,7 +17,7 @@ const PLATFORM_NAME = { google_ads: 'Google Ads', bing_ads: 'Bing Ads', meta_ads
 const ROLES = { marketer: 'Marketing manager (demo)', approver: 'Approver (demo)', finance: 'Finance (demo)' };
 
 const saved = (() => { try { return localStorage.getItem('maestro-currency'); } catch { return null; } })();
-const state = { grain: 'month', dateMode: 'months', dFrom: '', dTo: '', rangeYear: '', prevRange: null, division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
+const state = { pMeasure: 'spend', pBasis: 't3', pOpen: new Set(), grain: 'month', dateMode: 'months', dFrom: '', dTo: '', rangeYear: '', prevRange: null, division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
 let meta, facts;
 
 async function api(path, body) {
@@ -461,124 +461,92 @@ async function drawZoom() {
 }
 
 // ---- Projections -----------------------------------------------------------
+// Spend, appointments and bookings, projected by channel (starting from budget) and shared down to the brand's CRM campaigns.
+const PROJ = { spend: { name: 'Spend', money: true }, appts: { name: 'Appointments', money: false }, bookings: { name: 'Bookings $', money: true } };
+const BASIS = { t3: 'Last 3 closed months', t12: 'Last 12 closed months', ly: 'Same month last year' };
 async function projections(el) {
-  facts = await api('/api/facts?' + scope());
-  const { camps } = buildModel(facts);
-  const months = yearMonths(), openMonths = months.filter((m) => !closed(m)), closedMonths = months.filter(closed), last3 = meta.months.filter(closed).slice(-3);
-  const rows = camps.filter((c) => months.some((m) => c.m[m] && (c.m[m].actual || c.m[m].projected)));
-  const val = (c, m) => (c.m[m] ? (closed(m) ? c.m[m].actual : c.m[m].projected) : 0);
-  const outlook = (c) => months.reduce((a, m) => a + val(c, m), 0);
-  const trail = (c) => sum(c, last3);
-
-  // Channel level: actuals for closed months; for open months the re-forecast if one was entered,
-  // otherwise the budget, otherwise what the campaigns underneath add up to.
-  const plan = new Map(facts.plan.map((p) => [`${p.brand_id}|${p.channel_id}|${p.month}`, p]));
-  const brandIds = [...new Set([...rows.map((c) => c.brand_id), ...facts.plan.map((p) => p.brand_id)])];
-  const chRows = meta.channels.map((ch) => {
-    const inCh = rows.filter((c) => c.channel.id === ch.id);
-    const cells = months.map((m) => {
-      const x = { m, budget: 0, detail: 0, forecast: 0, set: false };
-      for (const b of brandIds) {
-        const p = plan.get(`${b}|${ch.id}|${m}`), detail = inCh.reduce((t, c) => t + (c.brand_id === b ? val(c, m) : 0), 0);
-        x.budget += p?.budget || 0; x.detail += detail;
-        if (p?.n) x.set = true;
-        x.forecast += closed(m) ? detail : p?.n ? p.eff : p?.budget || detail;
-      }
-      return x;
-    });
-    return { ch, cells };
-  }).filter((r) => r.cells.some((x) => x.budget || x.detail || x.forecast));
-  const T = { budget: 0, ytd: 0, ytdBudget: 0, open: 0, openBudget: 0, detail: 0 };
-  for (const r of chRows) for (const x of r.cells) { T.budget += x.budget; if (closed(x.m)) { T.ytd += x.detail; T.ytdBudget += x.budget; } else { T.open += x.forecast; T.openBudget += x.budget; T.detail += x.detail; } }
-  const out = T.ytd + T.open, d = out - T.budget, canEdit = !!state.brand, hasBudget = T.budget > 0;
-  const chBody = chRows.map((r, i) => {
-    const b = r.cells.reduce((t, x) => t + x.budget, 0), o = r.cells.reduce((t, x) => t + x.forecast, 0);
-    const od = r.cells.filter((x) => !closed(x.m)), det = od.reduce((t, x) => t + x.detail, 0), fc = od.reduce((t, x) => t + x.forecast, 0);
-    return `<tr><td class="l"><i class="dot" style="background:${COLORS[meta.channels.indexOf(r.ch)]}"></i>${esc(r.ch.name)}</td>` + r.cells.map((x) => {
-      const tip = `Budget ${money(x.budget)} · campaigns ${money(x.detail)}`;
-      return closed(x.m) || !canEdit ? `<td class="${closed(x.m) ? 'closed' : ''}" title="${tip}">${x.forecast ? int(x.forecast) : '—'}</td>`
-        : `<td class="cell"><input type="number" min="0" step="100" class="${x.set ? 'set' : ''}" value="${Math.round(x.forecast)}" data-ch="${r.ch.id}" data-m="${x.m}" data-was="${Math.round(x.forecast)}" title="${tip}${x.set ? ' · re-forecast (clear the cell to go back to budget)' : ''}" aria-label="${esc(r.ch.name)} forecast ${mlabel(x.m)}"></td>`;
-    }).join('') + `<td>${b ? money(b) : '—'}</td><td>${money(o)}</td><td class="${b && o > b ? 'down' : ''}">${b ? money(o - b) : '—'}</td><td>${money(det)}</td><td class="${Math.abs(fc - det) > 1 ? '' : 'muted'}">${money(fc - det)}</td></tr>`;
-  }).join('');
-
-  // Campaign level. Across all brands the grid would run to hundreds of rows, so it rolls up to Level 1 and becomes read-only.
-  const label = (c) => c.name + (state.brand || c.rollup ? '' : ` · ${brandCode(c.brand_id)}`);
-  const wide = !state.brand && rows.length > 150;
-  const shown = !wide ? rows : meta.level1.map((l) => {
-    const inL = rows.filter((c) => c.level1.id === l.id), m = {};
-    for (const mo of months) m[mo] = inL.reduce((t, c) => (c.m[mo] ? add(t, c.m[mo]) : t), sum({}, []));
-    return inL.length ? { id: 'l' + l.id, name: l.name, rollup: true, level1: l, channel: inL[0].channel, m } : null;
-  }).filter(Boolean);
-  let body = '';
-  for (const l of meta.level1) {
-    const inL = shown.filter((c) => c.level1.id === l.id); if (!inL.length) continue;
-    if (!wide) body += `<tr class="group"><td colspan="${months.length + 3}">${esc(l.name)} <span class="muted">· ${esc(inL[0].channel.name)}</span></td></tr>`;
-    for (const c of inL) {
-      const t = c.rollup ? inL.length && rows.filter((x) => x.level1.id === l.id).reduce((s, x) => add(s, trail(x)), sum({}, [])) : trail(c);
-      body += `<tr><td class="l">${esc(label(c))}</td>` + months.map((m) => {
-        const x = c.m[m] || { actual: 0, projected: 0 }, v = closed(m) ? x.actual : x.projected;
-        return closed(m) || wide ? `<td class="${closed(m) ? 'closed' : ''}">${v ? int(v) : '—'}</td>`
-          : `<td class="cell"><input type="number" min="0" step="10" value="${Math.round(x.projected)}" data-c="${c.id}" data-m="${m}" data-was="${Math.round(x.projected)}" aria-label="${esc(c.name)} projected ${mlabel(m)}"></td>`;
-      }).join('') + `<td>${money(outlook(c))}</td><td>${ratio(t.actual, t.appts, money)}</td></tr>`;
-    }
-  }
-  state.glMonth = closedMonths.includes(state.glMonth) ? state.glMonth : closedMonths.at(-1);
-  const glRows = !state.glMonth ? [] : meta.level1.map((l) => ({ l, gl: facts.gl.filter((g) => g.level1_id === l.id && g.month === state.glMonth).reduce((a, g) => a + g.amount, 0),
-    src: rows.filter((c) => c.level1.id === l.id && !c.source.startsWith('gl_')).reduce((a, c) => a + (c.m[state.glMonth]?.actual || 0), 0) })).filter((r) => r.gl || r.src);
-  const glT = glRows.reduce((t, r) => ({ gl: t.gl + r.gl, src: t.src + r.src }), { gl: 0, src: 0 });
-  const note = (x, gl) => (Math.abs(x) < Math.max(50, gl * 0.02) ? 'Tied out' : x > 0 ? 'In GL, not tied to a campaign: allocate' : 'Sourced, not in GL yet: accrual candidate');
+  const k = state.pMeasure, P = PROJ[k], fmt = P.money ? money : int, big = P.money ? compact : int;
+  const [d, f] = await Promise.all([api(`/api/projections?${scope()}&year=${state.year}&basis=${state.pBasis}`), state.location ? null : api('/api/facts?' + scope())]);
+  // Figures are entered for one market location; wider views add the locations up and are read-only.
+  const months = d.months, openMonths = months.filter((m) => !closed(m)), closedMonths = months.filter(closed), canEdit = !!d.brand && !!d.location;
+  const locName = d.location ? meta.locations.find((l) => l.id === d.location)?.name : '';
+  const sumOf = (arr, pick) => arr.reduce((a, v, i) => a + (pick(months[i]) ? v : 0), 0), all = () => true, isOpen = (m) => !closed(m);
+  const T = d.channels.reduce((t, c) => { const x = c.m[k]; t.budget += sumOf(x.budget, all); t.ytd += sumOf(x.actual, closed); t.ytdBudget += sumOf(x.budget, closed); t.open += sumOf(x.proj, isOpen); t.openBudget += sumOf(x.budget, isOpen); return t; }, { budget: 0, ytd: 0, ytdBudget: 0, open: 0, openBudget: 0 });
+  const outlook = T.ytd + T.open, diff = outlook - T.budget, has = d.hasBudget[k], moreIsGood = k !== 'spend';
   const th = months.map((m) => `<th>${mlabel(m)}${closed(m) ? '' : '*'}</th>`).join('');
+  const val = (v) => (Math.abs(v) >= 0.5 ? int(v) : '—');
+  const input = (v, attrs, set, tip) => `<td class="cell"><input type="number" min="0" step="${P.money ? 100 : 1}" class="${set ? 'set' : ''}" value="${P.money ? Math.round(v) : Math.round(v * 10) / 10}" data-was="${P.money ? Math.round(v) : Math.round(v * 10) / 10}" ${attrs} title="${tip}"></td>`;
+  let body = '';
+  d.channels.forEach((c) => {
+    const x = c.m[k], ci = meta.channels.findIndex((m) => m.id === c.id), open = state.pOpen.has(c.id), camps = d.campaigns.filter((cp) => cp.ch === c.id);
+    const b = sumOf(x.budget, all), o = sumOf(x.proj, all);
+    body += `<tr class="ch" ${d.brand ? `data-pch="${c.id}"` : ''}><td class="l">${d.brand ? (open ? '▾ ' : '▸ ') : ''}<i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}${d.brand ? ` <span class="muted" style="font-weight:400">(${camps.length})</span>` : ''}</td>` + months.map((m, i) => {
+      const tip = `Budget ${fmt(x.budget[i])}${x.fromRunRate[i] ? ' · no budget for this month, so it starts from the average of the last 3 closed months' : ''}${x.set[i] ? ' · adjusted from the default (clear the cell to reset)' : ''}`;
+      return closed(m) || !canEdit ? `<td class="${closed(m) ? 'closed' : ''}" title="${tip}">${val(x.proj[i])}</td>` : input(x.proj[i], `data-ch="${c.id}" data-m="${m}" aria-label="${esc(c.name)} ${P.name} ${mlabel(m)}"`, x.set[i], tip);
+    }).join('') + `<td>${b ? fmt(b) : '—'}</td><td>${fmt(o)}</td><td class="${b && (o > b) !== moreIsGood ? 'down' : b ? 'up' : ''}">${b ? (o - b >= 0 ? '+' : '−') + fmt(Math.abs(o - b)) : '—'}</td></tr>`;
+    if (!open || !d.brand) return;
+    // the brand's CRM campaigns in this channel, largest first
+    for (const cp of camps.sort((a1, b1) => sumOf(b1.m[k].proj, all) - sumOf(a1.m[k].proj, all))) {
+      const y = cp.m[k];
+      body += `<tr class="cp"><td class="l">${esc(cp.name)} <span class="muted">· ${esc(cp.level1)}</span></td>` + months.map((m, i) => (closed(m) || !canEdit ? `<td class="${closed(m) ? 'closed' : ''}">${val(y.proj[i])}</td>`
+        : input(y.proj[i], `data-camp="${cp.id}" data-m="${m}" aria-label="${esc(cp.name)} ${P.name} ${mlabel(m)}"`, y.manual[i], y.manual[i] ? 'Entered by hand. Clear the cell to go back to its automatic share.' : 'Automatic share of the channel figure. Type a number to set it by hand.'))).join('') +
+        `<td></td><td>${fmt(sumOf(y.proj, all))}</td><td></td></tr>`;
+    }
+    const u = d.unassigned[c.id]?.[k] || months.map(() => 0);
+    if (u.some((v) => Math.abs(v) >= 0.5)) body += `<tr class="cp un"><td class="l muted">Not on a CRM campaign</td>` + months.map((m, i) => `<td class="${closed(m) ? 'closed' : ''} ${!closed(m) && u[i] < -0.5 ? 'down' : 'muted'}" title="${closed(m) ? 'Actuals in this channel that are not recorded against a CRM campaign' : u[i] < -0.5 ? 'Campaign overrides add up to more than the channel figure' : 'Channel projection not yet given to a campaign'}">${val(u[i])}</td>`).join('') + `<td></td><td class="muted">${fmt(sumOf(u, all))}</td><td></td></tr>`;
+  });
+  const totals = months.map((_, i) => d.channels.reduce((a, c) => a + c.m[k].proj[i], 0));
+  body += `<tr class="total"><td class="l">Total</td>${totals.map((v, i) => `<td class="${closed(months[i]) ? 'closed' : ''}">${val(v)}</td>`).join('')}<td>${T.budget ? fmt(T.budget) : '—'}</td><td>${fmt(outlook)}</td><td>${T.budget ? (diff >= 0 ? '+' : '−') + fmt(Math.abs(diff)) : '—'}</td></tr>`;
+
+  // GL reconciliation, as before: ledger spend against spend tied to campaigns, by Level 1
+  let gl = '';
+  if (f && closedMonths.length) {
+    state.glMonth = closedMonths.includes(state.glMonth) ? state.glMonth : closedMonths.at(-1);
+    const l1Of = new Map(f.campaigns.map((c) => [c.id, c])), src = {};
+    for (const s of f.spend) { const c = l1Of.get(s.campaign_id); if (c && s.month === state.glMonth && !c.source.startsWith('gl_')) src[c.level1_id] = (src[c.level1_id] || 0) + s.actual; }
+    const rows = meta.level1.map((l) => ({ l, gl: f.gl.filter((g) => g.level1_id === l.id && g.month === state.glMonth).reduce((a, g) => a + g.amount, 0), src: src[l.id] || 0 })).filter((r) => r.gl || r.src);
+    const t = rows.reduce((a, r) => ({ gl: a.gl + r.gl, src: a.src + r.src }), { gl: 0, src: 0 });
+    const note = (x, g) => (Math.abs(x) < Math.max(50, g * 0.02) ? 'Tied out' : x > 0 ? 'In GL, not tied to a campaign: allocate' : 'Sourced, not in GL yet: accrual candidate');
+    gl = `<div class="card"><div class="row" style="justify-content:space-between"><div><h2>GL reconciliation and accrual signal</h2><p class="sub">General ledger marketing spend against spend from the connected ad platforms, by Level 1.</p></div>
+      <label>Month <select id="gl-month">${closedMonths.map((m) => `<option ${m === state.glMonth ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label></div>
+      <div class="scroll"><table><tr><th>Level 1</th><th>GL account</th><th>GL actual</th><th>From ad platforms</th><th>Difference</th><th class="l">Reading</th></tr>
+      ${rows.map((r) => `<tr><td>${esc(r.l.name)}</td><td>${esc(r.l.gl_account || '—')}</td><td>${money(r.gl)}</td><td>${money(r.src)}</td><td>${money(r.gl - r.src)}</td><td class="l muted">${note(r.gl - r.src, r.gl)}</td></tr>`).join('')}
+      <tr class="total"><td>Total</td><td></td><td>${money(t.gl)}</td><td>${money(t.src)}</td><td>${money(t.gl - t.src)}</td><td class="l">${ratio(t.src, t.gl, pct)} of GL explained by a platform</td></tr></table></div></div>`;
+  }
 
   el.innerHTML = `
-    <h1>Maestro <span class="hl">Projections</span> · ${state.year}</h1><p class="sub">Budget is set once a year by channel and does not move. The channel forecast is the official outlook and is re-forecast monthly; campaign projections are the detail underneath, refreshed quarterly.</p>
-    <div class="tiles">
-      <div class="tile"><div class="k">Annual budget</div><div class="v">${hasBudget ? compact(T.budget) : '—'}</div><div class="d">${hasBudget ? 'Set once, does not move' : 'No budget loaded for ' + state.year}</div></div>
-      <div class="tile"><div class="k">Actual to date</div><div class="v">${compact(T.ytd)}</div><div class="d">${hasBudget ? 'Budget to date ' + compact(T.ytdBudget) : closedMonths.length + ' closed months'}</div></div>
-      <div class="tile"><div class="k">Channel forecast, open months</div><div class="v">${compact(T.open)}</div><div class="d">Campaign detail ${compact(T.detail)} · unassigned ${compact(T.open - T.detail)}</div></div>
-      <div class="tile"><div class="k">Full-year outlook</div><div class="v">${compact(out)}</div><div class="d">${hasBudget ? `<span class="${d > 0 ? 'down' : 'up'}">${d > 0 ? '▲' : '▼'} ${compact(Math.abs(d))}</span> ${d > 0 ? 'over' : 'under'} budget` : 'Actuals plus channel forecast'}</div></div>
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <div><h1>Maestro <span class="hl">Projections</span> · ${state.year}</h1><p class="sub" style="margin:0">Each open month starts at budget and is adjusted from there, by channel. The channel figure is then shared across the brand's CRM campaigns automatically, or you can set a campaign by hand.</p></div>
+      <div class="row"><span class="ctl-l">Projecting</span><div class="seg pills">${Object.entries(PROJ).map(([id, p]) => `<button data-pm="${id}" class="${id === k ? 'on' : ''}">${p.name}</button>`).join('')}</div></div>
     </div>
-    <div class="card"><h2>Channel forecast, monthly</h2><p class="sub">Grey cells are actuals. ${canEdit ? 'White cells are the forecast for open months: type a new figure and press Enter to re-forecast. A bold cell has been re-forecast; clear it to return to budget.' : 'Pick a brand above to re-forecast.'} Until a month is re-forecast it shows the budget, or the campaign total where there is no budget. "Unassigned" is channel forecast not yet given to a campaign.</p>
-      <div class="scroll"><table><tr><th>Channel</th>${th}<th>FY budget</th><th>FY outlook</th><th>Var</th><th>Campaigns, open mo</th><th>Unassigned</th></tr>${chBody || `<tr><td class="l muted" colspan="${months.length + 6}">Nothing for ${state.year} yet. Load a budget on the Import screen or pick a brand and enter a forecast.</td></tr>`}</table></div></div>
-    ${wide ? '<div class="banner">Campaign detail below shows Level 1 totals across all brands. Pick a brand above to re-forecast campaigns or move spend.</div>' : !openMonths.length || rows.length < 2 ? '' : `<div class="card"><h2>Move spend between campaigns</h2><p class="sub">Takes projected dollars from one campaign and gives them to another in the same open month. The estimate uses each campaign's cost per appointment over the last three closed months.</p>
-      <div class="row">
-        <label>From <select id="r-from">${opts(rows, null, label)}</select></label>
-        <label>To <select id="r-to">${opts(rows, rows[1]?.id, label)}</select></label>
-        <label>Month <select id="r-month">${openMonths.map((m) => `<option value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label>
-        <label>Amount <input id="r-amt" type="number" min="0" step="100" value="1000" style="width:110px"></label>
-        <button class="primary" id="r-go">Move spend</button>
-      </div><div class="preview" id="r-prev"></div></div>`}
-    <div class="card"><h2>Campaign detail, quarterly</h2><p class="sub">Grey cells are actuals. White cells are projected spend you can edit; press Enter or leave the cell to save.</p>
-      <div class="scroll"><table><tr><th>${wide ? 'Level 1' : 'Campaign'}</th>${th}<th>FY outlook</th><th>CPA, last 3 mo</th></tr>${body || `<tr><td class="l muted" colspan="${months.length + 3}">No campaign spend or projections for ${state.year} yet.</td></tr>`}</table></div></div>
-    ${!state.glMonth ? '' : state.location ? '<div class="card"><h2>GL reconciliation</h2><p class="sub">Connected feeds are mostly held by brand, so clear the market location filter to see the reconciliation.</p></div>' : `
-    <div class="card"><div class="row" style="justify-content:space-between"><div><h2>GL reconciliation and accrual signal</h2><p class="sub">General ledger marketing spend against spend tied to campaigns, by Level 1.</p></div>
-      <label>Month <select id="gl-month">${closedMonths.map((m) => `<option ${m === state.glMonth ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label></div>
-      <div class="scroll"><table><tr><th>Level 1</th><th>GL account</th><th>GL actual</th><th>Tied to campaigns</th><th>Difference</th><th class="l">Reading</th></tr>
-      ${glRows.map((r) => `<tr><td>${esc(r.l.name)}</td><td>${esc(r.l.gl_account || '—')}</td><td>${money(r.gl)}</td><td>${money(r.src)}</td><td>${money(r.gl - r.src)}</td><td class="l muted">${note(r.gl - r.src, r.gl)}</td></tr>`).join('')}
-      <tr class="total"><td>Total</td><td></td><td>${money(glT.gl)}</td><td>${money(glT.src)}</td><td>${money(glT.gl - glT.src)}</td><td class="l">${ratio(glT.src, glT.gl, pct)} of GL explained</td></tr></table></div></div>`}`;
+    ${!has ? `<div class="banner">No ${P.name.toLowerCase()} budget is loaded for ${state.year}, so open months start from the average of the last three closed months instead. Load a budget on the Import screen and they will start from budget.</div>` : ''}
+    ${!d.brand ? '<div class="banner" style="background:var(--wash);border-color:#cfe0f5">Showing channel totals for every brand in view. Pick a brand and one of its market locations above to enter projections.</div>' : !d.location ? '<div class="banner" style="background:var(--wash);border-color:#cfe0f5">This is the total of the brand\'s market locations. Projections are entered by market location: pick one above to adjust it.</div>' : ''}
+    <div class="tiles">
+      <div class="tile"><div class="k">Annual budget</div><div class="v">${has ? big(T.budget) : '—'}</div><div class="d">${has ? 'Set once, does not move' : 'Not loaded for ' + state.year}</div></div>
+      <div class="tile"><div class="k">Actual to date</div><div class="v">${big(T.ytd)}</div><div class="d">${has ? 'Budget to date ' + big(T.ytdBudget) : closedMonths.length + ' closed months'}</div></div>
+      <div class="tile"><div class="k">Projected, open months</div><div class="v">${big(T.open)}</div><div class="d">${has ? 'Budget for those months ' + big(T.openBudget) : openMonths.length + ' open months'}</div></div>
+      <div class="tile"><div class="k">Full-year outlook</div><div class="v">${big(outlook)}</div><div class="d">${has ? `<span class="${(diff > 0) === moreIsGood ? 'up' : 'down'}">${diff > 0 ? '▲' : '▼'} ${big(Math.abs(diff))}</span> ${diff > 0 ? 'over' : 'under'} budget` : 'Actuals plus projection'}</div></div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><div><h2>${P.name} by channel${d.brand ? ' and CRM campaign' : ''}${locName ? ` · ${esc(locName)}` : ''}</h2>
+        <p class="sub" style="margin:0">Grey cells are actuals. ${canEdit ? 'White cells are projections: type a figure and press Enter. A bold cell has been changed by hand; clear it to go back to the default. Select a channel to open its campaigns.' : 'Months marked * are open.'}</p></div>
+        ${d.brand ? `<label>Share a channel across its campaigns by <select id="p-basis">${Object.entries(BASIS).map(([id, n]) => `<option value="${id}" ${id === state.pBasis ? 'selected' : ''}>${n}</option>`).join('')}</select></label>` : ''}</div>
+      ${d.brand ? `<p class="sub" style="margin:6px 0 0">Campaigns without a hand-entered figure share what is left of their channel in proportion to their ${k === 'bookings' ? 'bookings' : 'appointments'} at that market location over the chosen period${k === 'spend' ? ' (spend follows appointments, on the assumption that campaigns bringing in appointments are the ones being paid for)' : ''}. A campaign with no activity in that period gets nothing until you enter a figure for it.</p>` : ''}
+      <div class="scroll" style="margin-top:10px"><table><tr><th>Channel${d.brand ? ' / CRM campaign' : ''}</th>${th}<th>FY budget</th><th>FY outlook</th><th>Var</th></tr>${body}</table></div>
+    </div>
+    ${gl}`;
 
-  if ($('#r-go')) {
-    const byId = (id) => rows.find((c) => String(c.id) === String(id));
-    const preview = () => {
-      const a = byId($('#r-from').value), b = byId($('#r-to').value), m = $('#r-month').value, amt = Number($('#r-amt').value) || 0;
-      if (!a || !b) return;
-      const ta = trail(a), tb = trail(b), cpa = (t) => (t.appts ? t.actual / t.appts : null), roas = (t) => (t.actual ? t.bookings / t.actual : null);
-      const lose = cpa(ta) ? amt / cpa(ta) : 0, gain = cpa(tb) ? amt / cpa(tb) : 0, bk = amt * ((roas(tb) || 0) - (roas(ta) || 0));
-      const have = a.m[m]?.projected || 0;
-      $('#r-prev').innerHTML = a.brand_id !== b.brand_id ? 'Pick two campaigns from the same brand.' :
-        `${esc(a.name)} has ${money(have)} projected for ${mlabel(m)} (CPA ${cpa(ta) ? money(cpa(ta)) : '—'}); ${esc(b.name)} runs at CPA ${cpa(tb) ? money(cpa(tb)) : '—'}.
-         Moving ${money(amt)} is estimated to change appointments by <b>${gain - lose >= 0 ? '+' : ''}${(gain - lose).toFixed(1)}</b> and bookings by <b>${bk >= 0 ? '+' : ''}${money(bk)}</b>.${amt > have ? ' <span class="down">That is more than the source campaign has projected.</span>' : ''}`;
-      $('#r-go').disabled = a.brand_id !== b.brand_id || a.id === b.id || amt <= 0 || amt > have;
-    };
-    ['#r-from', '#r-to', '#r-month', '#r-amt'].forEach((s) => ($(s).oninput = preview)); preview();
-    $('#r-go').onclick = () => act(() => api('/api/reallocate', { from: Number($('#r-from').value), to: Number($('#r-to').value), month: $('#r-month').value, amount: Number($('#r-amt').value), location_id: state.location }), 'Spend moved');
-  }
+  $$('[data-pm]', el).forEach((b) => (b.onclick = () => { state.pMeasure = b.dataset.pm; render(); }));
+  if ($('#p-basis')) $('#p-basis').onchange = (e) => { state.pBasis = e.target.value; render(); };
+  $$('tr[data-pch]', el).forEach((r) => (r.onclick = (e) => { if (e.target.tagName === 'INPUT') return; const id = Number(r.dataset.pch); state.pOpen.has(id) ? state.pOpen.delete(id) : state.pOpen.add(id); render(); }));
   $$('td.cell input', el).forEach((i) => {
     i.oninput = () => i.classList.toggle('dirty', i.value !== i.dataset.was);
     i.onkeydown = (e) => { if (e.key === 'Enter') i.blur(); };
     i.onchange = () => {
       if (i.value === i.dataset.was) return;
-      if (i.dataset.ch) act(() => api('/api/channel-forecast', { brand_id: Number(state.brand), location_id: state.location, channel_id: Number(i.dataset.ch), month: i.dataset.m, amount: i.value === '' ? null : Number(i.value) }), i.value === '' ? 'Back to budget' : 'Channel forecast saved');
-      else act(() => api('/api/projected', { campaign_id: Number(i.dataset.c), month: i.dataset.m, amount: Number(i.value), location_id: state.location }), 'Projection saved');
+      const amount = i.value === '' ? null : Number(i.value);
+      if (i.dataset.ch) act(() => api('/api/projections/channel', { location_id: d.location, channel_id: Number(i.dataset.ch), month: i.dataset.m, measure: k, amount }), amount == null ? 'Back to the default' : 'Channel projection saved');
+      else act(() => api('/api/projections/campaign', { location_id: d.location, campaign_id: Number(i.dataset.camp), month: i.dataset.m, measure: k, amount }), amount == null ? 'Back to its automatic share' : 'Campaign set by hand');
     };
   });
   if ($('#gl-month')) $('#gl-month').onchange = (e) => { state.glMonth = e.target.value; render(); };
