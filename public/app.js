@@ -17,7 +17,7 @@ const PLATFORM_NAME = { google_ads: 'Google Ads', bing_ads: 'Bing Ads', meta_ads
 const ROLES = { marketer: 'Marketing manager (demo)', approver: 'Approver (demo)', finance: 'Finance (demo)' };
 
 const saved = (() => { try { return localStorage.getItem('maestro-currency'); } catch { return null; } })();
-const state = { division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
+const state = { grain: 'month', dateMode: 'months', dFrom: '', dTo: '', rangeYear: '', prevRange: null, division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
 let meta, facts;
 
 async function api(path, body) {
@@ -69,106 +69,151 @@ function sum(c, months, into) {
 }
 const add = (a, b) => { for (const k in a) a[k] += b[k]; return a; };
 
+// ---- dates -----------------------------------------------------------------
+const pad2 = (n) => String(n).padStart(2, '0');
+const toDate = (d) => new Date(d + 'T12:00:00');
+const iso = (dt) => `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+const addDays = (d, n) => { const dt = toDate(d); dt.setDate(dt.getDate() + n); return iso(dt); };
+const monthStart = (m) => m + '-01';
+const monthEnd = (m) => iso(new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)), 0, 12));
+const niceDay = (d, withYear = true) => toDate(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', ...(withYear ? { year: 'numeric' } : {}) });
+const GRAINS = { month: 'Months', week: 'Weeks', day: 'Days' };
+// How a bucket key reads on the axis and in a tooltip, and the dates it covers.
+const bucketLabel = { month: (k) => mlabel(k), week: (k) => niceDay(k, false), day: (k) => niceDay(k, false) };
+const bucketTitle = { month: (k) => `${mlabel(k)} ${k.slice(0, 4)}`, week: (k) => `Week of ${niceDay(k)}`, day: (k) => toDate(k).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) };
+const bucketSpan = { month: (k) => [monthStart(k), monthEnd(k)], week: (k) => [k, addDays(k, 6)], day: (k) => [k, k] };
+
 // ---- chart -----------------------------------------------------------------
-function stackedChart(host, { months, series, markers, fmt, selected, onMonth }) {
-  const W = 960, H = 280, L = 56, R = 12, T = 12, B = 30, pw = W - L - R, ph = H - T - B;
-  const totals = months.map((_, i) => series.reduce((a, s) => a + s.values[i], 0));
+// Stacked bars drawn at the real pixel width of their container and redrawn when that changes.
+// A click on a bar and a double-click on a colour are told apart by a short delay.
+function stackedChart(host, opts) {
+  const { buckets, series, markers, fmt, label, title, onBucket, onSeries, hint } = opts;
+  const W = Math.max(300, Math.round(host.clientWidth || 960)), H = Math.round(Math.min(400, Math.max(210, W * 0.3)));
+  const L = W < 520 ? 44 : 56, R = 12, T = 12, B = 30, pw = W - L - R, ph = H - T - B;
+  const totals = buckets.map((_, i) => series.reduce((a, s) => a + Math.max(0, s.values[i]), 0));
   const max = Math.max(1, ...totals, ...(markers || []));
   const step = (() => { const raw = max / 4, p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 2.5, 5, 10].map((k) => k * p).find((s) => s >= raw); })();
-  const top = Math.ceil(max / step) * step, y = (v) => T + ph - (v / top) * ph, bw = pw / months.length, w = Math.min(44, bw * 0.6);
+  const top = Math.ceil(max / step) * step, y = (v) => T + ph - (v / top) * ph, bw = pw / Math.max(1, buckets.length), w = Math.max(1, Math.min(72, bw * (bw < 6 ? 0.85 : 0.62)));
+  const every = Math.max(1, Math.ceil(46 / bw)), gap = w >= 6 ? 2 : 0, stacks = [];
   let svg = '';
   for (let v = 0; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${v ? 'var(--grid)' : 'var(--axis)'}"/><text x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`;
-  // Selected months sit on a wash; the hover band follows the pointer.
-  if (selected) months.forEach((m, i) => { if (selected.includes(m)) svg += `<rect x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="var(--wash)"/>`; });
   svg += `<rect class="hov" x="0" y="${T}" width="${bw}" height="${ph}" fill="var(--ink)" opacity="0" pointer-events="none"/>`;
-  months.forEach((m, i) => {
-    const x = L + bw * i + (bw - w) / 2, op = (closed(m) ? 1 : 0.45) * (selected && !selected.includes(m) ? 0.4 : 1);
+  buckets.forEach((b, i) => {
+    const x = L + bw * i + (bw - w) / 2, live = series.filter((s) => s.values[i] > 0), segs = [];
     let base = 0;
-    const live = series.map((s, si) => ({ s, si })).filter((o) => o.s.values[i] > 0);
-    live.forEach(({ s }, k) => {
-      const v = s.values[i], y1 = y(base + v), h = Math.max(0, y(base) - y1 - (k < live.length - 1 ? 2 : 0)), r = k === live.length - 1 ? Math.min(4, h) : 0, yt = y(base) - h;
-      svg += `<path d="M${x},${yt + h}V${yt + r}Q${x},${yt} ${x + r},${yt}H${x + w - r}Q${x + w},${yt} ${x + w},${yt + r}V${yt + h}Z" fill="${s.color}" opacity="${op}"/>`;
+    live.forEach((s, k) => {
+      const v = s.values[i], h = Math.max(0, y(base) - y(base + v) - (k < live.length - 1 ? gap : 0)), r = k === live.length - 1 ? Math.min(4, h, w / 2) : 0, yt = y(base) - h;
+      svg += `<path d="M${x},${yt + h}V${yt + r}Q${x},${yt} ${x + r},${yt}H${x + w - r}Q${x + w},${yt} ${x + w},${yt + r}V${yt + h}Z" fill="${s.color}"/>`;
+      segs.push({ id: s.id, y0: yt, y1: yt + h + gap });
       base += v;
     });
+    stacks.push(segs);
     if (markers && markers[i] > 0) svg += `<line x1="${x - 5}" x2="${x + w + 5}" y1="${y(markers[i])}" y2="${y(markers[i])}" stroke="var(--ink)" stroke-width="2"/>`;
-    svg += `<text x="${L + bw * i + bw / 2}" y="${H - 10}" text-anchor="middle">${mlabel(m)}${closed(m) ? '' : '*'}</text><rect data-i="${i}" x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="transparent" style="cursor:${onMonth && closed(m) ? 'pointer' : 'default'}"/>`;
+    if (i % every === 0) svg += `<text x="${L + bw * i + bw / 2}" y="${H - 10}" text-anchor="middle">${bw < 34 && every === 1 ? label(b)[0] : label(b)}</text>`;
+    svg += `<rect data-i="${i}" x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="transparent" style="cursor:${onBucket || onSeries ? 'pointer' : 'default'}"/>`;
   });
-  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Monthly stacked bars by channel">${svg}</svg><div class="tip"></div>`;
-  const tip = $('.tip', host), hov = $('.hov', host);
-  host.onclick = (e) => { const i = e.target.dataset?.i; if (i != null && onMonth && closed(months[i])) onMonth(months[i]); };
+  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Stacked bars over time">${svg}</svg><div class="tip"></div>`;
+  const tip = $('.tip', host), hov = $('.hov', host), svgEl = $('svg', host);
+  const segAt = (e) => { const i = e.target.dataset?.i; if (i == null) return null; const py = (e.clientY - svgEl.getBoundingClientRect().top) * (H / svgEl.getBoundingClientRect().height); return stacks[i].find((s) => py >= s.y0 && py <= s.y1) || null; };
+  let timer;
+  host.onclick = (e) => { const i = e.target.dataset?.i; if (i == null || !onBucket) return; clearTimeout(timer); timer = setTimeout(() => onBucket(buckets[i]), 260); };
+  host.ondblclick = (e) => { clearTimeout(timer); const s = segAt(e); if (s && onSeries) onSeries(s.id); };
   host.onmousemove = (e) => {
     const i = e.target.dataset?.i; if (i == null) { hov.setAttribute('opacity', 0); return (tip.style.display = 'none'); }
     hov.setAttribute('x', L + bw * i); hov.setAttribute('opacity', 0.06);
-    tip.innerHTML = `<b>${mlabel(months[i])} ${months[i].slice(0, 4)}${closed(months[i]) ? '' : ' · projected'}</b>` +
-      series.map((s) => `<div><span><i class="dot" style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.values[i])}</span></div>`).join('') +
+    const at = segAt(e);
+    tip.innerHTML = `<b>${title(buckets[i])}</b>` +
+      series.filter((s) => s.values[i]).map((s) => `<div ${at?.id === s.id ? 'style="font-weight:650"' : ''}><span><i class="dot" style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.values[i])}</span></div>`).join('') +
       `<div><span><b style="display:inline">Total</b></span><span><b style="display:inline">${fmt(totals[i])}</b></span></div>` +
-      (markers ? `<div><span>Budget</span><span>${fmt(markers[i])}</span></div>` : '') +
-      (onMonth && closed(months[i]) ? `<div style="margin-top:4px"><span>${selected?.length === 1 && selected[0] === months[i] ? 'Click to go back to the full period' : 'Click to focus the page on this month'}</span></div>` : '');
+      (markers ? `<div><span>Budget</span><span>${fmt(markers[i])}</span></div>` : '') + (hint ? `<div style="margin-top:4px"><span>${hint}</span></div>` : '');
     const box = host.getBoundingClientRect(); tip.style.display = 'block';
-    tip.style.left = Math.min(e.clientX - box.left + 14, box.width - tip.offsetWidth - 4) + 'px'; tip.style.top = Math.max(0, e.clientY - box.top - 20) + 'px';
+    tip.style.left = Math.max(0, Math.min(e.clientX - box.left + 14, box.width - tip.offsetWidth - 4)) + 'px'; tip.style.top = Math.max(0, e.clientY - box.top - 20) + 'px';
   };
   host.onmouseleave = () => { tip.style.display = 'none'; hov.setAttribute('opacity', 0); };
+  host._ro?.disconnect();
+  host._ro = new ResizeObserver(() => { if (host.isConnected && Math.abs(host.clientWidth - W) > 6 && host.clientWidth > 0) stackedChart(host, opts); });
+  host._ro.observe(host);
+}
+// Turn series rows from the server into chart series for one measure.
+function pivot(data, measure, names, colorOf) {
+  const idx = new Map(data.buckets.map((b, i) => [b, i])), by = new Map();
+  for (const r of data.rows) {
+    if (r.key == null) continue;
+    const s = by.get(r.key) || by.set(r.key, { id: r.key, name: names(r.key), values: data.buckets.map(() => 0), total: { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 } }).get(r.key);
+    s.values[idx.get(r.bucket)] += r[measure] || 0;
+    for (const k in s.total) s.total[k] += r[k] || 0;
+  }
+  return [...by.values()].map((s) => ({ ...s, color: colorOf(s.id) }));
 }
 
 // ---- Insights --------------------------------------------------------------
+const MEASURES = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', bookings: 'Bookings $' };
+const rangeQuery = () => scope() + `&from=${state.dFrom}&to=${state.dTo}`;
+let ins = null; // what the Insights screen last loaded
 async function insights(el) {
-  facts = await api('/api/facts?' + scope());
   const closedMonths = yearMonths().filter(closed);
   if (!closedMonths.length) { el.innerHTML = `<h1>Insights · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Projections screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
-  if (!closedMonths.includes(state.from) || !closedMonths.includes(state.to)) { state.from = closedMonths[0]; state.to = closedMonths.at(-1); }
+  if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
+  const [f, range, series] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`)]);
+  facts = f; ins = { range, series };
   drawInsights(el);
 }
 function drawInsights(el) {
-  const { camps, unmapped } = buildModel(facts, true);
-  const closedMonths = yearMonths().filter(closed);
-  const feeds = buildModel(facts).camps.filter((c) => PLATFORMS.includes(c.source)).map((c) => ({ c, t: sum(c, closedMonths.filter((m) => m >= state.from && m <= state.to)) }));
-  const feedSpend = feeds.reduce((a, r) => a + r.t.actual, 0), feedLinked = feeds.filter((r) => r.c.linked_to || r.t.leads > 0).reduce((a, r) => a + r.t.actual, 0);
-  const range = closedMonths.filter((m) => m >= state.from && m <= state.to);
-  const tot = camps.reduce((t, c) => sum(c, range, t), undefined) || sum({}, []);
-  const un = sum(unmapped, range);
-  const planBudget = (months, chId) => facts.plan.reduce((a, p) => a + (months.includes(p.month) && (chId == null || p.channel_id === chId) ? p.budget : 0), 0);
-  for (const c of camps) for (const m in c.m) c.m[m].budget = 0; // campaign rows carry no budget of their own
-  tot.budget = planBudget(range);
-  const rows = camps.map((c) => ({ c, t: sum(c, range) })).filter((r) => r.t.actual || r.t.leads);
+  const l1 = Object.fromEntries(meta.level1.map((l) => [l.id, l])), ch = Object.fromEntries(meta.channels.map((c) => [c.id, c]));
+  const zero = () => ({ actual: 0, budget: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
+  const camps = new Map(facts.campaigns.map((c) => [c.id, { ...c, level1: l1[c.level1_id], channel: ch[l1[c.level1_id].channel_id], t: zero() }]));
+  const un = zero();
+  for (const r of ins.range.rows) { const t = r.key == null ? un : camps.get(r.key)?.t; if (t) { t.actual += r.spend; t.leads += r.leads; t.appts += r.appts; t.sales += r.sales; t.bookings += r.bookings; } }
+  // Ad-platform spend that is linked to a CRM campaign is shown on that campaign, with its sources kept for the drill-down.
+  const feeds = [...camps.values()].filter((c) => PLATFORMS.includes(c.source));
+  const feedSpend = feeds.reduce((a, c) => a + c.t.actual, 0), feedLinked = feeds.filter((c) => c.linked_to || c.t.leads > 0).reduce((a, c) => a + c.t.actual, 0);
+  for (const c of [...camps.values()]) {
+    const target = c.linked_to && camps.get(c.linked_to);
+    if (!target) continue;
+    target.t.actual += c.t.actual; (target.sourceList ||= []).push(c); target.sources = target.sourceList.length; camps.delete(c.id);
+  }
+  const rows = [...camps.values()].map((c) => ({ c, t: c.t })).filter((r) => Math.abs(r.t.actual) > 0.005 || r.t.leads || r.t.appts || r.t.sales);
+  const tot = rows.reduce((t, r) => add(t, r.t), zero());
+  const budgetOf = (chId) => ins.range.budget.reduce((a, p) => a + (chId == null || p.channel_id === chId ? p.budget : 0), 0);
+  tot.budget = budgetOf();
   const blended = tot.actual ? tot.bookings / tot.actual : 0;
   const weak = (r) => !r.c.source.startsWith('gl_') && r.t.leads > 0 && r.t.actual > tot.actual * 0.01 && r.t.bookings / r.t.actual < blended * 0.5;
   const v = tot.budget ? tot.actual / tot.budget - 1 : 0;
   const tiles = [
     ['Spend', compact(tot.actual), tot.budget ? `<span class="${v > 0 ? 'down' : 'up'}">${v > 0 ? '▲' : '▼'} ${pct(Math.abs(v))}</span> vs budget ${compact(tot.budget)}` : 'No budget loaded yet'],
-    ['Leads', int(tot.leads), `CPL ${cost(tot.actual, tot.leads)}`],
-    ['Appointments', int(tot.appts), `CPA ${cost(tot.actual, tot.appts)}`],
-    ['Sales', int(tot.sales), `Closing rate ${ratio(tot.sales, tot.appts, pct)}`],
-    ['Bookings $', compact(tot.bookings), `Conversion ${ratio(tot.appts, tot.leads, pct)} lead → appt`],
-    ['ROAS', ratio(tot.bookings, tot.actual, (x) => x.toFixed(1) + 'x'), `MCOB ${ratio(tot.actual, tot.bookings, pct)}`],
+    ['Leads', int(tot.leads + un.leads), `CPL ${cost(tot.actual, tot.leads + un.leads)}`],
+    ['Appointments', int(tot.appts + un.appts), `CPA ${cost(tot.actual, tot.appts + un.appts)}`],
+    ['Sales', int(tot.sales + un.sales), `Closing rate ${ratio(tot.sales + un.sales, tot.appts + un.appts, pct)}`],
+    ['Bookings $', compact(tot.bookings + un.bookings), `Conversion ${ratio(tot.appts + un.appts, tot.leads + un.leads, pct)} lead → appt`],
+    ['ROAS', ratio(tot.bookings + un.bookings, tot.actual, (x) => x.toFixed(1) + 'x'), `MCOB ${ratio(tot.actual, tot.bookings + un.bookings, pct)}`],
   ];
+  const wholeMonths = state.dFrom.endsWith('-01') && state.dTo === monthEnd(state.dTo.slice(0, 7));
+  const rangeText = wholeMonths ? (state.dFrom.slice(0, 7) === state.dTo.slice(0, 7) ? bucketTitle.month(state.dFrom.slice(0, 7)) : `${bucketTitle.month(state.dFrom.slice(0, 7))} to ${bucketTitle.month(state.dTo.slice(0, 7))}`) : `${niceDay(state.dFrom)} to ${niceDay(state.dTo)}`;
   // Footnote: third-party campaign detail only exists from the day each platform feed was switched on.
   const starts = Object.entries(meta.feedStart || {}).sort((a, b) => a[1].localeCompare(b[1]));
-  const day = (d) => new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-  const feedNote = starts.length && state.from <= starts.at(-1)[1].slice(0, 7)
-    ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${day(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier months campaign-level CPL and CPA read lower, and ROAS higher, than they really were. Level 1 and channel figures are unaffected.</p>` : '';
-  const measures = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', bookings: 'Bookings $' };
+  const feedNote = starts.length && state.dFrom <= starts.at(-1)[1]
+    ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${niceDay(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier periods campaign-level CPL and CPA read lower, and ROAS higher, than they really were. Level 1 and channel figures are unaffected.</p>` : '';
+  const dayNote = wholeMonths && state.grain === 'month' ? '' : `<p class="sub" style="margin:8px 0 0">Note: ad-platform spend and CRM outcomes are shown on the day they happened. Ledger-only spend has no meaningful day, so each month's amount is spread evenly across that month's days; part-month and weekly figures for it are estimates.</p>`;
   const head = '<tr><th>Channel / Level 1 / Campaign</th><th>Spend</th><th>Budget</th><th>Var</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>Close %</th><th>ROAS</th><th class="l">Flag</th></tr>';
   const line = (cls, key, label, t, flag = '') => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td><td>${money(t.actual)}</td><td>${t.budget ? money(t.budget) : '—'}</td>
     <td class="${t.budget && t.actual > t.budget ? 'down' : ''}">${ratio(t.actual - t.budget, t.budget, (x) => (x > 0 ? '+' : '') + pct(x))}</td><td>${int(t.leads)}</td><td>${int(t.appts)}</td><td>${int(t.sales)}</td><td>${money(t.bookings)}</td>
     <td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td>${ratio(t.bookings, t.actual, (x) => x.toFixed(1) + 'x')}</td><td class="l">${flag}</td></tr>`;
   let body = '';
-  meta.channels.forEach((ch, ci) => {
-    const inCh = rows.filter((r) => r.c.channel.id === ch.id); if (!inCh.length) return;
-    const chOpen = !state.open.has('c' + ch.id); // channels start expanded
-    body += line('ch', 'c' + ch.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(ch.name)}`, Object.assign(inCh.reduce((t, r) => add(t, r.t), sum({}, [])), { budget: planBudget(range, ch.id) }));
+  meta.channels.forEach((c, ci) => {
+    const inCh = rows.filter((r) => r.c.channel.id === c.id); if (!inCh.length) return;
+    const chOpen = !state.open.has('c' + c.id); // channels start expanded
+    body += line('ch', 'c' + c.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}`, Object.assign(inCh.reduce((t, r) => add(t, r.t), zero()), { budget: budgetOf(c.id) }));
     if (!chOpen) return;
-    for (const l of meta.level1.filter((l) => l.channel_id === ch.id)) {
+    for (const l of meta.level1.filter((x) => x.channel_id === c.id)) {
       const inL = inCh.filter((r) => r.c.level1.id === l.id); if (!inL.length) continue;
       const lOpen = state.open.has('l' + l.id), nWeak = inL.filter(weak).length;
-      body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, inL.reduce((t, r) => add(t, r.t), sum({}, [])), nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '');
-      if (lOpen) for (const r of inL.sort((a, b) => b.t.actual - a.t.actual))
-      {
+      body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, inL.reduce((t, r) => add(t, r.t), zero()), nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '');
+      if (lOpen) for (const r of inL.sort((a, b) => b.t.actual - a.t.actual)) {
         // A campaign fed by linked ad-platform campaigns opens to show them: the lowest level of third-party detail.
         const srcKey = r.c.sources ? 's' + r.c.id : '', srcOpen = srcKey && state.open.has(srcKey);
         body += line('cp', srcKey, (srcKey ? (srcOpen ? '▾ ' : '▸ ') : '') + esc(r.c.name) + (state.brand ? '' : ` <span class="muted">· ${brandCode(r.c.brand_id)}</span>`) + (r.c.sources ? ` <span class="chip">${r.c.sources} spend source${r.c.sources > 1 ? 's' : ''}</span>` : ''), r.t, weak(r) ? '<span class="chip warn">⚠ Low return</span> <a href="#projections">Reallocate</a>' : '');
         if (srcOpen) {
-          const srcs = r.c.sourceList.map((s) => ({ s, spend: sum(s, range).actual })).sort((a, b) => b.spend - a.spend);
-          const linked = srcs.reduce((a, x) => a + x.spend, 0);
+          const srcs = r.c.sourceList.map((s) => ({ s, spend: s.t.actual })).sort((a, b) => b.spend - a.spend), linked = srcs.reduce((a, x) => a + x.spend, 0);
           for (const x of srcs) body += `<tr class="src"><td>${esc(x.s.name)} <span class="chip">${PLATFORM_NAME[x.s.source] || esc(x.s.source)}</span></td><td>${money(x.spend)}</td><td colspan="11" class="l muted">${x.spend ? `${pct(linked ? x.spend / linked : 0)} of this campaign's platform spend` : 'No spend in this period'} · ${esc(x.s.level1.name)}</td></tr>`;
           if (Math.abs(r.t.actual - linked) > 1) body += `<tr class="src"><td class="muted">Spend recorded on the CRM campaign itself</td><td>${money(r.t.actual - linked)}</td><td colspan="11"></td></tr>`;
         }
@@ -178,42 +223,105 @@ function drawInsights(el) {
   if (un.leads) body += line('l1', '', 'Not mapped to a campaign', un, '<a href="#mappings">Map names</a>');
   body += line('total', '', 'Total', Object.assign(add({ ...tot }, un), { budget: tot.budget }));
 
+  const through = meta.dataThrough, months = meta.months.filter((m) => m <= through.slice(0, 7));
+  const monthOpts = (sel) => months.map((m) => `<option ${m === sel ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('');
+  const off = meta.mode === 'real' ? meta.brands.filter((b) => !b.in_ledger && (!state.brand || String(b.id) === state.brand) && rows.some((r) => r.c.brand_id === b.id && r.t.actual)) : [];
   el.innerHTML = `
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
       <div><h1>Insights</h1><p class="sub" style="margin:0">Return on marketing spend. Outcomes follow the CRM lead-created campaign; spend follows the campaign's connected source.</p></div>
-      <div class="row"><label>From <select id="from">${closedMonths.map((m) => `<option ${m === state.from ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label>
-      <label>To <select id="to">${closedMonths.map((m) => `<option ${m === state.to ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label></div>
+      <div class="row">
+        <label>Period by <div class="seg"><button data-mode="months" class="${state.dateMode === 'months' ? 'on' : ''}">Month</button><button data-mode="dates" class="${state.dateMode === 'dates' ? 'on' : ''}">Dates</button></div></label>
+        ${state.dateMode === 'months'
+          ? `<label>From <select id="from-m">${monthOpts(state.dFrom.slice(0, 7))}</select></label><label>To <select id="to-m">${monthOpts(state.dTo.slice(0, 7))}</select></label>`
+          : `<label>From <input type="date" id="from-d" value="${state.dFrom}" min="${meta.months[0]}-01" max="${through}"></label><label>To <input type="date" id="to-d" value="${state.dTo}" min="${meta.months[0]}-01" max="${through}"></label>`}
+        ${state.prevRange ? '<button id="full-range">Back to full period</button>' : ''}
+      </div>
     </div>
     ${un.leads ? `<div class="banner">${int(un.leads)} leads and ${money(un.bookings)} of bookings in this period sit under CRM campaign names that are not mapped yet. <a href="#mappings">Review mappings</a></div>` : ''}
     ${feedSpend ? `<div class="banner" style="background:var(--wash);border-color:#cfe0f5">${compact(feedLinked)} of ${compact(feedSpend)} ad-platform spend (${pct(feedLinked / feedSpend)}) is linked to a CRM campaign, so those campaigns show their own CPL, CPA and ROAS. The rest meets its outcomes at Level 1 only. <a href="#mappings" id="go-links">Review spend links</a></div>` : ''}
-    ${(() => { const off = meta.mode === 'real' ? meta.brands.filter((b) => !b.in_ledger && (!state.brand || String(b.id) === state.brand) && camps.some((c) => c.brand_id === b.id && sum(c, range).actual)) : []; return off.length ? `<div class="banner">${off.map((b) => esc(b.name)).join(', ')} ${off.length > 1 ? 'are' : 'is'} not in any loaded ledger. ${off.length > 1 ? 'Their' : 'Its'} spend here is ad-platform feeds only, so anything bought outside those platforms is missing.</div>` : ''; })()}
+    ${off.length ? `<div class="banner">${off.map((b) => esc(b.name)).join(', ')} ${off.length > 1 ? 'are' : 'is'} not in any loaded ledger. ${off.length > 1 ? 'Their' : 'Its'} spend here is ad-platform feeds only, so anything bought outside those platforms is missing.</div>` : ''}
     <div class="tiles">${tiles.map(([k, val, d]) => `<div class="tile"><div class="k">${k}</div><div class="v">${val}</div><div class="d">${d}</div></div>`).join('')}</div>
     <div class="card">
-      <div class="row" style="justify-content:space-between"><div><h2>${measures[state.measure]} by channel, by month</h2><p class="sub" style="margin:0">${state.year}. Months marked * are open: spend shown is the current projection and outcomes are not in yet. Click a month to focus the whole page on it; click a channel in the legend to hide or show it.</p></div>
-      ${range.length < closedMonths.length ? '<button id="full-range">Back to full period</button>' : ''}<div class="seg">${Object.entries(measures).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div>
-      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Show or hide ${esc(c.name)} in the chart"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${state.measure === 'spend' && planBudget(yearMonths()) ? '<span><i class="tick"></i>Budget</span>' : ''}</div>
-      <div class="chart" id="chart"></div>
+      <div class="row" style="justify-content:space-between"><div><h2>${MEASURES[state.measure]} by channel, by ${state.grain}</h2><p class="sub" style="margin:0">${rangeText}. Click a bar to zoom into it; double-click a colour, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
+      <div class="row"><div class="seg" aria-label="Chart interval">${Object.entries(GRAINS).map(([k, n]) => `<button data-grain="${k}" class="${k === state.grain ? 'on' : ''}">${n}</button>`).join('')}</div>
+      <div class="seg" aria-label="Measure">${Object.entries(MEASURES).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div></div>
+      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}</div>
+      <div class="chart" id="chart"></div>${dayNote}
     </div>
-    <div class="card"><h2>Channel and Level 1 performance</h2><p class="sub">${mlabel(state.from)} to ${mlabel(state.to)} ${state.to.slice(0, 4)}. Level 1 spend for closed months equals the Acumatica ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
+    <div class="card"><h2>Channel and Level 1 performance</h2><p class="sub">${rangeText}. Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
       <div class="scroll"><table>${head}${body}</table></div>${feedNote}</div>`;
 
-  const val = (c, m) => { const x = c.m[m]; if (!x) return 0; return state.measure === 'spend' ? (closed(m) ? x.actual : x.projected) : x[state.measure]; };
+  const chIndex = new Map(meta.channels.map((c, i) => [c.id, i]));
+  const series = pivot(ins.series, state.measure, (id) => ch[id]?.name || 'Other', (id) => COLORS[chIndex.get(id) ?? 8]).sort((a, b) => chIndex.get(a.id) - chIndex.get(b.id)).filter((s) => !state.hiddenCh.has(s.id));
+  const g = state.grain, reload = () => insights(el);
+  const setRange = (a, b, keepPrev) => { if (!keepPrev) state.prevRange = null; state.dFrom = a; state.dTo = b > through ? through : b; if (state.dFrom > state.dTo) state.dFrom = state.dTo; reload(); };
   stackedChart($('#chart'), {
-    months: yearMonths(),
-    series: meta.channels.map((ch, i) => ({ id: ch.id, name: ch.name, color: COLORS[i], values: yearMonths().map((m) => camps.filter((c) => c.channel.id === ch.id).reduce((a, c) => a + val(c, m), 0)) })).filter((s) => !state.hiddenCh.has(s.id)),
-    selected: range.length < closedMonths.length ? range : null,
-    onMonth: (m) => { if (state.from === m && state.to === m) { state.from = closedMonths[0]; state.to = closedMonths.at(-1); } else state.from = state.to = m; drawInsights(el); },
-    markers: state.measure === 'spend' && planBudget(yearMonths()) ? yearMonths().map((m) => planBudget([m])) : null,
-    fmt: state.measure === 'spend' || state.measure === 'bookings' ? compact : int,
+    buckets: ins.series.buckets, series, fmt: state.measure === 'spend' || state.measure === 'bookings' ? compact : int,
+    label: bucketLabel[g], title: bucketTitle[g], hint: g === 'day' ? 'Click to focus this day · double-click a colour to break it down' : 'Click to zoom in · double-click a colour to break it down',
+    // Zooming remembers where you came from, and steps the interval down so there is something to see.
+    onBucket: (k) => { state.prevRange ||= { from: state.dFrom, to: state.dTo, grain: state.grain }; const [a, b] = bucketSpan[g](k); if (g !== 'day') state.grain = 'day'; setRange(a < meta.months[0] + '-01' ? meta.months[0] + '-01' : a, b, true); },
+    onSeries: (id) => openDrill([{ group: 'level1', id, name: ch[id]?.name }]),
   });
-  $$('[data-lg]', el).forEach((b) => (b.onclick = () => { const id = Number(b.dataset.lg); state.hiddenCh.has(id) ? state.hiddenCh.delete(id) : state.hiddenCh.add(id); drawInsights(el); }));
+  let lgTimer;
+  $$('[data-lg]', el).forEach((b) => {
+    b.onclick = () => { clearTimeout(lgTimer); lgTimer = setTimeout(() => { const id = Number(b.dataset.lg); state.hiddenCh.has(id) ? state.hiddenCh.delete(id) : state.hiddenCh.add(id); drawInsights(el); }, 260); };
+    b.ondblclick = () => { clearTimeout(lgTimer); const id = Number(b.dataset.lg); openDrill([{ group: 'level1', id, name: ch[id]?.name }]); };
+  });
   if ($('#lg-all')) $('#lg-all').onclick = () => { state.hiddenCh.clear(); drawInsights(el); };
-  if ($('#full-range')) $('#full-range').onclick = () => { state.from = closedMonths[0]; state.to = closedMonths.at(-1); drawInsights(el); };
+  if ($('#full-range')) $('#full-range').onclick = () => { const p = state.prevRange; state.grain = p.grain; setRange(p.from, p.to); };
   if ($('#go-links')) $('#go-links').onclick = () => { state.mapTab = 'links'; };
-  $('#from').onchange = (e) => { state.from = e.target.value; if (state.to < state.from) state.to = state.from; drawInsights(el); };
-  $('#to').onchange = (e) => { state.to = e.target.value; if (state.from > state.to) state.from = state.to; drawInsights(el); };
+  $$('[data-mode]', el).forEach((b) => (b.onclick = () => { state.dateMode = b.dataset.mode; if (state.dateMode === 'months') setRange(monthStart(state.dFrom.slice(0, 7)), monthEnd(state.dTo.slice(0, 7))); else drawInsights(el); }));
+  if ($('#from-m')) {
+    $('#from-m').onchange = (e) => setRange(monthStart(e.target.value), e.target.value > state.dTo.slice(0, 7) ? monthEnd(e.target.value) : state.dTo);
+    $('#to-m').onchange = (e) => setRange(e.target.value < state.dFrom.slice(0, 7) ? monthStart(e.target.value) : state.dFrom, monthEnd(e.target.value));
+  } else {
+    $('#from-d').onchange = (e) => e.target.value && setRange(e.target.value, e.target.value > state.dTo ? e.target.value : state.dTo);
+    $('#to-d').onchange = (e) => e.target.value && setRange(e.target.value < state.dFrom ? e.target.value : state.dFrom, e.target.value);
+  }
+  $$('[data-grain]', el).forEach((b) => (b.onclick = () => { state.grain = b.dataset.grain; reload(); }));
   $$('[data-measure]', el).forEach((b) => (b.onclick = () => { state.measure = b.dataset.measure; drawInsights(el); }));
   $$('tr[data-key]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); drawInsights(el); }));
+}
+
+// ---- drill-down window -----------------------------------------------------
+// Opens over the page: a channel broken down by Level 1, then a Level 1 broken down by campaign.
+// `path` is the trail so far, e.g. [{ group: 'level1', id: channelId, name: 'Digital' }, { group: 'campaign', id: level1Id, name: 'Paid Search' }].
+async function openDrill(path) {
+  let dlg = $('#drill');
+  if (!dlg) { dlg = document.createElement('dialog'); dlg.id = 'drill'; document.body.appendChild(dlg); dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); }); }
+  const step = path.at(-1), byCampaign = step.group === 'campaign';
+  dlg.innerHTML = '<p class="sub" style="margin:0">Loading…</p>';
+  if (!dlg.open) dlg.showModal();
+  let data;
+  try { data = await api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=${step.group}&id=${step.id}`); } catch (e) { dlg.innerHTML = `<p>${esc(e.message)}</p><button id="d-close">Close</button>`; $('#d-close', dlg).onclick = () => dlg.close(); return; }
+  const l1 = Object.fromEntries(meta.level1.map((l) => [l.id, l.name])), nameOf = (id) => (byCampaign ? data.names?.[id] : l1[id]) || 'Unknown';
+  const draw = () => {
+    // The eight largest get their own colour; the rest fold into "Other" so the chart stays readable.
+    const all = pivot(data, state.measure, nameOf, () => '').sort((a, b) => b.total[state.measure] - a.total[state.measure]);
+    const top = all.slice(0, 8).map((s, i) => ({ ...s, color: COLORS[i] })), rest = all.slice(8);
+    const chart = rest.length ? [...top, { id: 'other', name: `Other (${rest.length})`, color: COLORS[8], values: data.buckets.map((_, i) => rest.reduce((a, s) => a + s.values[i], 0)) }] : top;
+    const colour = new Map(top.map((s) => [s.id, s.color])), fmt = state.measure === 'spend' || state.measure === 'bookings' ? compact : int;
+    const T = all.reduce((t, s) => { for (const k in t) t[k] += s.total[k]; return t; }, { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
+    const row = (s, cls = '') => `<tr class="${cls}" ${cls || byCampaign ? '' : `data-drill="${s.id}" title="Double-click to see its campaigns"`}><td><i class="dot" style="background:${colour.get(s.id) || COLORS[8]}"></i>${esc(s.name)}</td><td>${money(s.total.spend)}</td><td>${int(s.total.leads)}</td><td>${int(s.total.appts)}</td><td>${int(s.total.sales)}</td><td>${money(s.total.bookings)}</td><td>${cost(s.total.spend, s.total.leads)}</td><td>${cost(s.total.spend, s.total.appts)}</td><td>${ratio(s.total.bookings, s.total.spend, (x) => x.toFixed(1) + 'x')}</td></tr>`;
+    dlg.innerHTML = `
+      <div class="row" style="justify-content:space-between;align-items:flex-start">
+        <div><p class="sub" style="margin:0">${path.map((p, i) => (i < path.length - 1 ? `<button class="link" data-crumb="${i}">${esc(p.name)}</button> › ` : `<b>${esc(p.name)}</b>`)).join('')}</p>
+          <h2 style="margin-top:4px">${MEASURES[state.measure]} by ${byCampaign ? 'campaign' : 'Level 1'}, by ${state.grain}</h2>
+          <p class="sub" style="margin:0">${niceDay(state.dFrom)} to ${niceDay(state.dTo)}. ${byCampaign ? 'This is the lowest level of detail. Linked ad-platform spend sits on its CRM campaign.' : 'Double-click a colour, a legend entry or a table row to see its campaigns.'}</p></div>
+        <div class="row"><div class="seg">${Object.entries(MEASURES).map(([k, n]) => `<button data-dmeasure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div><button id="d-close" aria-label="Close">Close ✕</button></div>
+      </div>
+      <div class="legend">${chart.map((s) => `<button class="lg" ${s.id === 'other' || byCampaign ? 'disabled' : `data-drill="${s.id}"`}><i style="background:${s.color}"></i>${esc(s.name)}</button>`).join('')}</div>
+      <div class="chart" id="d-chart"></div>
+      <div class="scroll" style="max-height:38vh;overflow-y:auto;margin-top:12px"><table><tr><th>${byCampaign ? 'Campaign' : 'Level 1'}</th><th>Spend</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>ROAS</th></tr>
+        ${all.map((s) => row(s)).join('') || '<tr><td class="l muted" colspan="9">Nothing in this period.</td></tr>'}${all.length > 1 ? row({ id: 't', name: 'Total', total: T }, 'total') : ''}</table></div>`;
+    stackedChart($('#d-chart', dlg), { buckets: data.buckets, series: chart, fmt, label: bucketLabel[state.grain], title: bucketTitle[state.grain], hint: byCampaign ? '' : 'Double-click a colour to see its campaigns',
+      onSeries: byCampaign ? null : (id) => id !== 'other' && openDrill([...path, { group: 'campaign', id, name: l1[id] }]) });
+    $('#d-close', dlg).onclick = () => dlg.close();
+    $$('[data-dmeasure]', dlg).forEach((b) => (b.onclick = () => { state.measure = b.dataset.dmeasure; draw(); if (location.hash.slice(1) === 'insights' || !location.hash) drawInsights($('#view')); }));
+    $$('[data-crumb]', dlg).forEach((b) => (b.onclick = () => openDrill(path.slice(0, Number(b.dataset.crumb) + 1))));
+    $$('[data-drill]', dlg).forEach((b) => (b.ondblclick = () => openDrill([...path, { group: 'campaign', id: Number(b.dataset.drill), name: l1[b.dataset.drill] }])));
+  };
+  draw();
 }
 
 // ---- Projections -----------------------------------------------------------

@@ -3,7 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openDb, MONTHS, YEARS, CLOSED_THROUGH, FX_CAD_USD, REGIONS, divisionOf, getMode } from './db.js';
+import { openDb, MONTHS, YEARS, CLOSED_THROUGH, FX_CAD_USD, REGIONS, divisionOf, getMode, getThrough } from './db.js';
 import { listFolder, runImport } from './lib/importers.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
@@ -121,6 +121,38 @@ function linkRows() {
   return rows;
 }
 
+// ---- day-level aggregation ---------------------------------------------------
+// Sums spend and CRM outcomes over a date range into buckets (day, week, month or one total), keyed by whatever
+// the caller groups on. Four sources are combined:
+//   1. ad-platform spend, which is known by day;
+//   2. every other campaign's monthly spend (ledger-only and reconciling lines), spread evenly over the month's days,
+//      because a ledger date is when an invoice posted, not when the advertising ran;
+//   3. CRM outcomes by their actual day;
+//   4. monthly CRM outcomes for anything not held by day (demo data), spread the same way.
+// Linked ad-platform spend is counted on the CRM campaign it is linked to, as everywhere else in Insights.
+const BUCKET = { day: 'k.day', week: 'k.week', month: 'k.month', all: "'all'" };
+const isDate = (s) => /^\d{4}-\d\d-\d\d$/.test(s || '');
+function collect(query, grain, spendKey, crmKey, where) {
+  const a = query.from, b = query.to, loc = num(query.location), bk = BUCKET[grain];
+  need(isDate(a) && isDate(b) && a <= b, 'Pick a valid date range');
+  const cells = new Map();
+  const cell = (key, bucket) => { const k = `${key}|${bucket}`; let x = cells.get(k); if (!x) cells.set(k, (x = { key, bucket, spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 })); return x; };
+  const spendFrom = (table, amount, join, extra) => `SELECT ${spendKey} key, ${bk} bucket, SUM(${amount} * ${fxSql('b')}) v
+      FROM ${table} ${join} JOIN campaign cp ON cp.id = s.campaign_id JOIN brand b ON b.id = cp.brand_id
+      JOIN campaign e ON e.id = COALESCE(cp.linked_to, cp.id) JOIN level1 l ON l.id = e.level1_id
+      WHERE k.day BETWEEN ? AND ? AND ${inScope('cp.brand_id')} ${loc ? `AND s.location_id = ${loc}` : ''} AND ${where} ${extra} GROUP BY 1, 2`;
+  for (const r of q(spendFrom('spend_day s', 's.amount', 'JOIN cal k ON k.day = s.day', '')).all(a, b)) cell(r.key, r.bucket).spend += r.v;
+  for (const r of q(spendFrom('spend s', 's.actual / k.dim', 'JOIN cal k ON k.month = s.month AND k.live = 1', 'AND s.actual <> 0 AND s.campaign_id NOT IN (SELECT DISTINCT campaign_id FROM spend_day)')).all(a, b)) cell(r.key, r.bucket).spend += r.v;
+  const crmFrom = (table, div, join, extra) => `SELECT ${crmKey} key, ${bk} bucket, SUM(f.leads${div}) leads, SUM(f.appts${div}) appts, SUM(f.sales${div}) sales, SUM(f.bookings${div}) * ${usdFx()} bookings
+      FROM ${table} ${join} JOIN crm_name n ON n.id = f.crm_name_id JOIN location lo ON lo.id = f.location_id
+      LEFT JOIN campaign e ON e.id = n.campaign_id LEFT JOIN level1 l ON l.id = e.level1_id
+      WHERE k.day BETWEEN ? AND ? AND ${inScope('lo.brand_id')} ${loc ? `AND f.location_id = ${loc}` : ''} AND ${where} ${extra} GROUP BY 1, 2`;
+  const addCrm = (r) => { const x = cell(r.key, r.bucket); x.leads += r.leads; x.appts += r.appts; x.sales += r.sales; x.bookings += r.bookings; };
+  q(crmFrom('crm_day f', '', 'JOIN cal k ON k.day = f.day', '')).all(a, b).forEach(addCrm);
+  q(crmFrom('crm_fact f', ' / k.dim', 'JOIN cal k ON k.month = f.month AND k.live = 1', 'AND f.crm_name_id NOT IN (SELECT DISTINCT crm_name_id FROM crm_day)')).all(a, b).forEach(addCrm);
+  return { rows: [...cells.values()], buckets: grain === 'all' ? ['all'] : q(`SELECT DISTINCT ${bk} bucket FROM cal k WHERE k.day BETWEEN ? AND ? ORDER BY 1`).all(a, b).map((r) => r.bucket) };
+}
+
 // ---- API -------------------------------------------------------------------
 const routes = {
   'GET /api/meta': () => ({
@@ -129,7 +161,7 @@ const routes = {
     locations: q('SELECT * FROM location ORDER BY id').all(),
     channels: q('SELECT * FROM channel ORDER BY sort').all(),
     level1: q('SELECT * FROM level1 ORDER BY id').all(),
-    months: MONTHS, years: YEARS.map(String), closedThrough: CLOSED_THROUGH, mode: getMode(db), fx: FX_CAD_USD,
+    months: MONTHS, years: YEARS.map(String), closedThrough: CLOSED_THROUGH, mode: getMode(db), fx: FX_CAD_USD, dataThrough: getThrough(db),
     feedStart: JSON.parse(q("SELECT value FROM setting WHERE key = 'feed_start'").get()?.value || '{}'),
   }),
 
@@ -385,6 +417,26 @@ const routes = {
     audit(user, 'moved brand to region', `${b.name} → ${body.region} (${divisionOf(body.region)})`);
     return { ok: true };
   }),
+
+  // ---- day-level figures for Insights ---------------------------------------
+  // Totals per campaign for a date range, plus the budget pro-rated to that range.
+  'GET /api/range': ({ query }) => ({
+    rows: collect(query, 'all', 'cp.id', 'n.campaign_id', '1=1').rows,
+    budget: q(`SELECT p.channel_id, SUM(p.budget / k.mdays * ${fxSql('b')}) budget FROM channel_plan p JOIN cal k ON k.month = p.month JOIN brand b ON b.id = p.brand_id
+               WHERE k.day BETWEEN ? AND ? AND p.budget <> 0 AND ${inScope('p.brand_id')} ${num(query.location) ? `AND p.location_id = ${num(query.location)}` : ''} GROUP BY p.channel_id`).all(query.from, query.to),
+  }),
+
+  // A trend by day, week or month, grouped by channel, by Level 1 within a channel, or by campaign within a Level 1.
+  'GET /api/series': ({ query }) => {
+    const grain = ['day', 'week', 'month'].includes(query.grain) ? query.grain : 'month', id = num(query.id);
+    const by = { channel: ['l.channel_id', '1=1'], level1: ['e.level1_id', `l.channel_id = ${id || 0}`], campaign: ['e.id', `e.level1_id = ${id || 0}`] }[query.group] || ['l.channel_id', '1=1'];
+    const out = collect(query, grain, by[0], by[0], by[1]);
+    if (query.group === 'campaign') {
+      const ids = [...new Set(out.rows.map((r) => r.key).filter(Boolean))];
+      out.names = Object.fromEntries(q(`SELECT c.id, c.name, b.code FROM campaign c JOIN brand b ON b.id = c.brand_id WHERE c.id IN (${ids.join(',') || 0})`).all().map((c) => [c.id, SCOPE?.length === 1 ? c.name : `${c.name} · ${c.code}`]));
+    }
+    return out;
+  },
 
   'GET /api/audit': () => q('SELECT * FROM audit ORDER BY id DESC LIMIT 200').all(),
 };
