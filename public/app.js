@@ -150,12 +150,21 @@ function pivot(data, measure, names, colorOf) {
 const MEASURES = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', bookings: 'Bookings $' };
 const rangeQuery = () => scope() + `&from=${state.dFrom}&to=${state.dTo}`;
 let ins = null; // what the Insights screen last loaded
+const yearBack = (d) => { const y = Number(d.slice(0, 4)) - 1, rest = d.slice(4) === '-02-29' ? '-02-28' : d.slice(4); return y + rest; };
+// "VS. PY" chips in the portal's style: the change in the figure and in percent against the same dates last year.
+function pyChips(now, before, { fmt, goodWhenUp = true, neutral = false, points = false }) {
+  if (before == null || !Number.isFinite(before) || Math.abs(before) < 1e-9 || now == null) return '<div class="py"><span class="chip pyl">VS. PY</span><span class="muted" style="font-size:11.5px">no prior-year figure</span></div>';
+  const diff = now - before, up = diff >= 0, cls = neutral ? 'flat' : up === goodWhenUp ? 'good' : 'bad';
+  return `<div class="py"><span class="chip pyl">VS. PY</span><span class="chip ${cls}">${up ? '+' : '−'}${fmt(Math.abs(diff))}${points ? '' : ''}</span><span class="chip ${cls}">${up ? '▲' : '▼'} ${up ? '+' : '−'}${(Math.abs(diff / before) * 100).toFixed(1)}%</span></div>`;
+}
 async function insights(el) {
   const closedMonths = yearMonths().filter(closed);
-  if (!closedMonths.length) { el.innerHTML = `<h1>Insights · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Projections screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
+  if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Projections screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
   if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
-  const [f, range, series] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`)]);
-  facts = f; ins = { range, series };
+  const pyFrom = yearBack(state.dFrom), pyTo = yearBack(state.dTo), hasPy = pyFrom >= meta.months[0] + '-01';
+  const [f, range, series, py] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
+    hasPy ? api(`/api/totals?${scope()}&from=${pyFrom}&to=${pyTo}`) : null]);
+  facts = f; ins = { range, series, py, pyFrom, pyTo };
   drawInsights(el);
 }
 function drawInsights(el) {
@@ -179,13 +188,29 @@ function drawInsights(el) {
   const blended = tot.actual ? tot.bookings / tot.actual : 0;
   const weak = (r) => !r.c.source.startsWith('gl_') && r.t.leads > 0 && r.t.actual > tot.actual * 0.01 && r.t.bookings / r.t.actual < blended * 0.5;
   const v = tot.budget ? tot.actual / tot.budget - 1 : 0;
+  const all = add({ ...tot }, un);
+  // Each KPI card carries a small trend of the metric across the chart's current intervals.
+  const spark = (m) => {
+    const idx = new Map(ins.series.buckets.map((k, i) => [k, i])), top = ins.series.buckets.map(() => 0), bottom = ins.series.buckets.map(() => 0);
+    for (const r of ins.series.rows) { const i = idx.get(r.bucket); if (m === 'roas') { top[i] += r.bookings; bottom[i] += r.spend; } else top[i] += r[m] || 0; }
+    const vals = m === 'roas' ? top.map((x, i) => (bottom[i] > 0.5 ? x / bottom[i] : 0)) : top, max = Math.max(...vals, 1e-9);
+    if (vals.length < 2) return '';
+    const pts = vals.map((x, i) => `${((i / (vals.length - 1)) * 100).toFixed(2)},${(30 - (Math.max(0, x) / max) * 26).toFixed(2)}`);
+    return `<svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><path class="area" d="M0,32 L${pts.join(' L')} L100,32 Z"/><path class="line" d="M${pts.join(' L')}"/></svg>`;
+  };
+  const P = ins.py, roasOf = (b, s) => (s > 0.5 ? b / s : null);
+  const py = {
+    spend: pyChips(tot.actual, P?.spend, { fmt: compact, neutral: true }), leads: pyChips(all.leads, P?.leads, { fmt: int }), appts: pyChips(all.appts, P?.appts, { fmt: int }),
+    sales: pyChips(all.sales, P?.sales, { fmt: int }), bookings: pyChips(all.bookings, P?.bookings, { fmt: compact }),
+    roas: pyChips(roasOf(all.bookings, tot.actual), P ? roasOf(P.bookings, P.spend) : null, { fmt: (x) => x.toFixed(1) + 'x' }),
+  };
   const tiles = [
-    ['Spend', compact(tot.actual), tot.budget ? `<span class="${v > 0 ? 'down' : 'up'}">${v > 0 ? '▲' : '▼'} ${pct(Math.abs(v))}</span> vs budget ${compact(tot.budget)}` : 'No budget loaded yet'],
-    ['Leads', int(tot.leads + un.leads), `CPL ${cost(tot.actual, tot.leads + un.leads)}`],
-    ['Appointments', int(tot.appts + un.appts), `CPA ${cost(tot.actual, tot.appts + un.appts)}`],
-    ['Sales', int(tot.sales + un.sales), `Closing rate ${ratio(tot.sales + un.sales, tot.appts + un.appts, pct)}`],
-    ['Bookings $', compact(tot.bookings + un.bookings), `Conversion ${ratio(tot.appts + un.appts, tot.leads + un.leads, pct)} lead → appt`],
-    ['ROAS', ratio(tot.bookings + un.bookings, tot.actual, (x) => x.toFixed(1) + 'x'), `MCOB ${ratio(tot.actual, tot.bookings + un.bookings, pct)}`],
+    ['spend', compact(tot.actual), tot.budget ? `<span class="${v > 0 ? 'down' : 'up'}">${v > 0 ? '▲' : '▼'} ${pct(Math.abs(v))}</span> vs budget ${compact(tot.budget)}` : 'No budget loaded yet'],
+    ['leads', int(all.leads), `CPL ${cost(tot.actual, all.leads)}`],
+    ['appts', int(all.appts), `CPA ${cost(tot.actual, all.appts)}`],
+    ['sales', int(all.sales), `Closing rate ${ratio(all.sales, all.appts, pct)}`],
+    ['bookings', compact(all.bookings), `Conversion ${ratio(all.appts, all.leads, pct)} lead → appt`],
+    ['roas', ratio(all.bookings, tot.actual, (x) => x.toFixed(1) + 'x'), `MCOB ${ratio(tot.actual, all.bookings, pct)}`],
   ];
   const wholeMonths = state.dFrom.endsWith('-01') && state.dTo === monthEnd(state.dTo.slice(0, 7));
   const rangeText = wholeMonths ? (state.dFrom.slice(0, 7) === state.dTo.slice(0, 7) ? bucketTitle.month(state.dFrom.slice(0, 7)) : `${bucketTitle.month(state.dFrom.slice(0, 7))} to ${bucketTitle.month(state.dTo.slice(0, 7))}`) : `${niceDay(state.dFrom)} to ${niceDay(state.dTo)}`;
@@ -194,10 +219,10 @@ function drawInsights(el) {
   const feedNote = starts.length && state.dFrom <= starts.at(-1)[1]
     ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${niceDay(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier periods campaign-level CPL and CPA read lower, and ROAS higher, than they really were. Level 1 and channel figures are unaffected.</p>` : '';
   const dayNote = wholeMonths && state.grain === 'month' ? '' : `<p class="sub" style="margin:8px 0 0">Note: ad-platform spend and CRM outcomes are shown on the day they happened. Ledger-only spend has no meaningful day, so each month's amount is spread evenly across that month's days; part-month and weekly figures for it are estimates.</p>`;
-  const head = '<tr><th>Channel / Level 1 / Campaign</th><th>Spend</th><th>Budget</th><th>Var</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>Close %</th><th>ROAS</th><th class="l">Flag</th></tr>';
+  const head = '<tr><th>Channel / Level 1 / Campaign</th><th>Spend</th><th>Budget</th><th>Var</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>Close %</th><th>ROAS</th><th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th><th class="l">Flag</th></tr>';
   const line = (cls, key, label, t, flag = '') => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td><td>${money(t.actual)}</td><td>${t.budget ? money(t.budget) : '—'}</td>
     <td class="${t.budget && t.actual > t.budget ? 'down' : ''}">${ratio(t.actual - t.budget, t.budget, (x) => (x > 0 ? '+' : '') + pct(x))}</td><td>${int(t.leads)}</td><td>${int(t.appts)}</td><td>${int(t.sales)}</td><td>${money(t.bookings)}</td>
-    <td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td>${ratio(t.bookings, t.actual, (x) => x.toFixed(1) + 'x')}</td><td class="l">${flag}</td></tr>`;
+    <td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td>${ratio(t.bookings, t.actual, (x) => x.toFixed(1) + 'x')}</td><td>${t.actual > 0 ? ratio(t.actual, t.bookings, pct) : '—'}</td><td class="l">${flag}</td></tr>`;
   let body = '';
   meta.channels.forEach((c, ci) => {
     const inCh = rows.filter((r) => r.c.channel.id === c.id); if (!inCh.length) return;
@@ -214,8 +239,8 @@ function drawInsights(el) {
         body += line('cp', srcKey, (srcKey ? (srcOpen ? '▾ ' : '▸ ') : '') + esc(r.c.name) + (state.brand ? '' : ` <span class="muted">· ${brandCode(r.c.brand_id)}</span>`) + (r.c.sources ? ` <span class="chip">${r.c.sources} spend source${r.c.sources > 1 ? 's' : ''}</span>` : ''), r.t, weak(r) ? '<span class="chip warn">⚠ Low return</span> <a href="#projections">Reallocate</a>' : '');
         if (srcOpen) {
           const srcs = r.c.sourceList.map((s) => ({ s, spend: s.t.actual })).sort((a, b) => b.spend - a.spend), linked = srcs.reduce((a, x) => a + x.spend, 0);
-          for (const x of srcs) body += `<tr class="src"><td>${esc(x.s.name)} <span class="chip">${PLATFORM_NAME[x.s.source] || esc(x.s.source)}</span></td><td>${money(x.spend)}</td><td colspan="11" class="l muted">${x.spend ? `${pct(linked ? x.spend / linked : 0)} of this campaign's platform spend` : 'No spend in this period'} · ${esc(x.s.level1.name)}</td></tr>`;
-          if (Math.abs(r.t.actual - linked) > 1) body += `<tr class="src"><td class="muted">Spend recorded on the CRM campaign itself</td><td>${money(r.t.actual - linked)}</td><td colspan="11"></td></tr>`;
+          for (const x of srcs) body += `<tr class="src"><td>${esc(x.s.name)} <span class="chip">${PLATFORM_NAME[x.s.source] || esc(x.s.source)}</span></td><td>${money(x.spend)}</td><td colspan="12" class="l muted">${x.spend ? `${pct(linked ? x.spend / linked : 0)} of this campaign's platform spend` : 'No spend in this period'} · ${esc(x.s.level1.name)}</td></tr>`;
+          if (Math.abs(r.t.actual - linked) > 1) body += `<tr class="src"><td class="muted">Spend recorded on the CRM campaign itself</td><td>${money(r.t.actual - linked)}</td><td colspan="12"></td></tr>`;
         }
       }
     }
@@ -228,7 +253,7 @@ function drawInsights(el) {
   const off = meta.mode === 'real' ? meta.brands.filter((b) => !b.in_ledger && (!state.brand || String(b.id) === state.brand) && rows.some((r) => r.c.brand_id === b.id && r.t.actual)) : [];
   el.innerHTML = `
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
-      <div><h1>Insights</h1><p class="sub" style="margin:0">Return on marketing spend. Outcomes follow the CRM lead-created campaign; spend follows the campaign's connected source.</p></div>
+      <div><h1>Maestro <span class="hl">Insights</span></h1><p class="sub" style="margin:0">Return on marketing spend. Outcomes follow the CRM lead-created campaign; spend follows the campaign's connected source.</p></div>
       <div class="row">
         <label>Period by <div class="seg"><button data-mode="months" class="${state.dateMode === 'months' ? 'on' : ''}">Month</button><button data-mode="dates" class="${state.dateMode === 'dates' ? 'on' : ''}">Dates</button></div></label>
         ${state.dateMode === 'months'
@@ -240,7 +265,8 @@ function drawInsights(el) {
     ${un.leads ? `<div class="banner">${int(un.leads)} leads and ${money(un.bookings)} of bookings in this period sit under CRM campaign names that are not mapped yet. <a href="#mappings">Review mappings</a></div>` : ''}
     ${feedSpend ? `<div class="banner" style="background:var(--wash);border-color:#cfe0f5">${compact(feedLinked)} of ${compact(feedSpend)} ad-platform spend (${pct(feedLinked / feedSpend)}) is linked to a CRM campaign, so those campaigns show their own CPL, CPA and ROAS. The rest meets its outcomes at Level 1 only. <a href="#mappings" id="go-links">Review spend links</a></div>` : ''}
     ${off.length ? `<div class="banner">${off.map((b) => esc(b.name)).join(', ')} ${off.length > 1 ? 'are' : 'is'} not in any loaded ledger. ${off.length > 1 ? 'Their' : 'Its'} spend here is ad-platform feeds only, so anything bought outside those platforms is missing.</div>` : ''}
-    <div class="tiles">${tiles.map(([k, val, d]) => `<div class="tile"><div class="k">${k}</div><div class="v">${val}</div><div class="d">${d}</div></div>`).join('')}</div>
+    <div class="tiles">${tiles.map(([m, val, d]) => `<div class="tile kpi"><div class="kpi-top"><span class="k">${KPIS[m].name}<span class="help" title="${esc(KPIS[m].help)}">?</span></span><button class="zoom" data-zoom="${m}" title="Break ${KPIS[m].name} down by brand, market location, service offering and customer type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Zoom</button></div><div class="v">${val}</div><div class="d">${d}</div>${py[m]}${spark(m)}</div>`).join('')}</div>
+    ${ins.py ? `<p class="sub" style="margin:-6px 0 14px">VS. PY compares with ${niceDay(ins.pyFrom)} to ${niceDay(ins.pyTo)}. Brands that joined part-way through that period have only part of it to compare against, and spend then came from the ledger alone.</p>` : ''}
     <div class="card">
       <div class="row" style="justify-content:space-between"><div><h2>${MEASURES[state.measure]} by channel, by ${state.grain}</h2><p class="sub" style="margin:0">${rangeText}. Click a bar to zoom into it; double-click a colour, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
       <div class="row"><div class="seg" aria-label="Chart interval">${Object.entries(GRAINS).map(([k, n]) => `<button data-grain="${k}" class="${k === state.grain ? 'on' : ''}">${n}</button>`).join('')}</div>
@@ -280,6 +306,7 @@ function drawInsights(el) {
   }
   $$('[data-grain]', el).forEach((b) => (b.onclick = () => { state.grain = b.dataset.grain; reload(); }));
   $$('[data-measure]', el).forEach((b) => (b.onclick = () => { state.measure = b.dataset.measure; drawInsights(el); }));
+  $$('[data-zoom]', el).forEach((b) => (b.onclick = () => openZoom(b.dataset.zoom)));
   $$('tr[data-key]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); drawInsights(el); }));
 }
 
@@ -322,6 +349,81 @@ async function openDrill(path) {
     $$('[data-drill]', dlg).forEach((b) => (b.ondblclick = () => openDrill([...path, { group: 'campaign', id: Number(b.dataset.drill), name: l1[b.dataset.drill] }])));
   };
   draw();
+}
+
+// ---- KPI zoom --------------------------------------------------------------
+// A KPI card's Zoom opens the metric broken down by Brand, then Market location, then Service offering, then
+// Customer type. Selecting a row filters to it and moves to the next breakdown; selecting the total lists the records.
+const KPIS = {
+  spend: { name: 'Spend', help: 'Marketing spend for the period. For closed months this equals the ledger; ad-platform campaigns and reconciling lines sit underneath.', fmt: (v) => money(v), of: (r) => r.spend, records: true, additive: true, crm: false },
+  leads: { name: 'Leads', help: 'New leads created in the period. Additional projects on an existing lead are not counted.', fmt: int, of: (r) => r.leads, records: true, additive: true, crm: true },
+  appts: { name: 'Appointments', help: 'Qualified leads with an appointment booked in the period, counted on the date the appointment was booked.', fmt: int, of: (r) => r.appts, records: true, additive: true, crm: true },
+  sales: { name: 'Sales', help: 'Sold or completed jobs closed in the period. Additional projects on the same sale are not counted.', fmt: int, of: (r) => r.sales, records: true, additive: true, crm: true },
+  bookings: { name: 'Bookings $', help: 'Final contract value of every sold or completed project closed in the period, including additional projects.', fmt: (v) => money(v), of: (r) => r.bookings, records: true, additive: true, crm: true },
+  roas: { name: 'ROAS', help: 'Bookings $ divided by spend. MCOB is the same relationship the other way round: spend as a share of bookings.', fmt: (v) => (v == null ? '—' : v.toFixed(1) + 'x'), of: (r) => (r.spend > 0.5 ? r.bookings / r.spend : null), records: false, additive: false, crm: false },
+};
+const ZOOM_DIMS = [['brand', 'Brand'], ['location', 'Market location'], ['service', 'Service offering'], ['ctype', 'Customer type']];
+let zoom = null;
+function openZoom(measure) {
+  zoom = { measure, dim: state.brand ? 'location' : 'brand', f: {}, view: 'breakdown' };
+  drawZoom();
+}
+async function drawZoom() {
+  let dlg = $('#drill');
+  if (!dlg) { dlg = document.createElement('dialog'); dlg.id = 'drill'; document.body.appendChild(dlg); dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); }); }
+  if (!dlg.open) { dlg.innerHTML = '<p class="sub" style="margin:0">Loading…</p>'; dlg.showModal(); }
+  const k = KPIS[zoom.measure], f = zoom.f;
+  const fq = Object.entries(f).map(([d, v]) => `&f_${d}=${encodeURIComponent(v.key)}`).join('');
+  const dimName = Object.fromEntries(ZOOM_DIMS);
+  const labelOf = (dim, key) => (dim === 'brand' ? meta.brands.find((b) => b.id === key)?.name : dim === 'location' ? meta.locations.find((l) => l.id === key)?.name : key) || '(Not recorded)';
+  const chips = Object.entries(f).map(([d, v]) => `<button class="chip fchip" data-unf="${d}" title="Remove this filter">${dimName[d]}: ${esc(v.label)} ✕</button>`).join(' ');
+  const head = `
+    <div class="row" style="justify-content:space-between;align-items:flex-start">
+      <div><h2>${k.name} <span class="hl">Zoom</span></h2><p class="sub" style="margin:0">${niceDay(state.dFrom)} to ${niceDay(state.dTo)}. ${esc(k.help)}</p></div>
+      <button id="d-close" aria-label="Close">Close ✕</button>
+    </div>
+    ${chips ? `<p style="margin:8px 0 0">${chips}</p>` : ''}`;
+  const close = () => { $('#d-close', dlg).onclick = () => dlg.close(); $$('[data-unf]', dlg).forEach((b) => (b.onclick = () => { delete zoom.f[b.dataset.unf]; zoom.view = 'breakdown'; drawZoom(); })); };
+
+  if (zoom.view === 'records') {
+    const url = `/api/records?${rangeQuery()}&measure=${zoom.measure}${fq}`;
+    let d; try { d = await api(url); } catch (e) { dlg.innerHTML = head + `<p>${esc(e.message)}</p>`; close(); return; }
+    const isMoney = (c) => /Amount|Contract/.test(c);
+    dlg.innerHTML = head + `
+      <div class="row" style="justify-content:space-between;margin-top:12px"><p class="sub" style="margin:0"><button class="link" id="z-back">‹ Back to the breakdown</button> · ${d.count.toLocaleString()} ${zoom.measure === 'spend' ? 'ledger lines' : 'records'}${d.count > d.shown ? `, showing the first ${d.shown.toLocaleString()}` : ''} · total ${money(d.total)}</p>
+        <a class="btn" href="${url}&format=csv&cur=${state.cur}" download>Download all as CSV</a></div>
+      ${zoom.measure === 'spend' ? '<p class="sub" style="margin:6px 0 0">These are the ledger lines for the months in the period, which is the official spend. Ad-platform campaign detail is in the chart drill-down. Brands or months with no ledger loaded have no lines here.</p>' : ''}
+      <div class="scroll" style="max-height:56vh;overflow-y:auto;margin-top:10px"><table><tr>${d.cols.map((c, i) => `<th class="${isMoney(c) ? '' : 'l'}">${esc(c)}</th>`).join('')}</tr>
+        ${d.rows.map((r) => `<tr>${r.map((v, i) => `<td class="${isMoney(d.cols[i]) ? '' : 'l'}">${v == null || v === '' ? '—' : isMoney(d.cols[i]) ? money(v) : esc(v)}</td>`).join('')}</tr>`).join('') || `<tr><td class="l muted" colspan="${d.cols.length}">No records for this selection.</td></tr>`}</table></div>`;
+    close(); $('#z-back', dlg).onclick = () => { zoom.view = 'breakdown'; drawZoom(); };
+    return;
+  }
+
+  let d; try { d = await api(`/api/zoom?${rangeQuery()}&dim=${zoom.dim}${fq}`); } catch (e) { dlg.innerHTML = head + `<p>${esc(e.message)}</p>`; close(); return; }
+  const crmOnly = !d.hasSpend, blocked = !k.crm && crmOnly;
+  const rows = d.rows.map((r) => ({ ...r, label: labelOf(zoom.dim, r.key), v: k.of(r) })).filter((r) => r.spend || r.leads || r.appts || r.sales || r.bookings).sort((a, b) => (b.v ?? -1) - (a.v ?? -1));
+  const T = rows.reduce((t, r) => { for (const x of ['spend', 'leads', 'appts', 'sales', 'bookings']) t[x] += r[x] || 0; return t; }, { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
+  if (crmOnly) T.spend = null;
+  const totalV = k.of(T), max = Math.max(1, ...rows.map((r) => Math.abs(r.v || 0)));
+  const next = ZOOM_DIMS.map(([id]) => id).filter((id) => id !== zoom.dim && !f[id]).find((id) => ZOOM_DIMS.findIndex(([x]) => x === id) > ZOOM_DIMS.findIndex(([x]) => x === zoom.dim));
+  // CPA and MCOB need spend, so they are blank on the service offering and customer type breakdowns.
+  const cells = (r) => `<td>${r.spend == null ? '—' : money(r.spend)}</td><td>${int(r.leads)}</td><td>${int(r.appts)}</td><td>${int(r.sales)}</td><td>${money(r.bookings)}</td>
+    <td>${r.spend == null ? '—' : cost(r.spend, r.appts)}</td><td>${ratio(r.sales, r.appts, pct)}</td><td>${r.spend == null ? '—' : ratio(r.spend, r.bookings, pct)}</td>`;
+  const tab = ([id, name]) => { const off = f[id] || ((id === 'service' || id === 'ctype') && (!k.crm || !d.hasRecords)); return `<button data-zdim="${id}" class="${id === zoom.dim ? 'on' : ''}" ${off ? `disabled title="${f[id] ? 'Already filtered' : !d.hasRecords ? 'Needs CRM records, which the demo data does not have' : 'Not recorded for this measure'}"` : ''}>${name}</button>`; };
+  dlg.innerHTML = head + `
+    <div class="row" style="justify-content:space-between;margin-top:12px"><div class="tabs" style="margin:0;border:0">${ZOOM_DIMS.map(tab).join('')}</div>
+      <p class="sub" style="margin:0">${next ? `Select a row to filter to it and continue to ${dimName[next]}.` : 'Select a row to filter to it.'} ${k.records ? 'Select the total to list the underlying records.' : ''}</p></div>
+    ${!k.crm ? '<p class="sub" style="margin:6px 0 0">Service offering and customer type are recorded on CRM records only, so they are not available for spend-based measures.</p>' : ''}
+    ${blocked ? '<p style="margin-top:12px">This measure needs spend, which is not recorded by service offering or customer type. Remove that filter to see it.</p>' : `
+    <div class="scroll" style="max-height:56vh;overflow-y:auto;margin-top:10px"><table>
+      <tr><th>${dimName[zoom.dim]}</th><th>${k.name}</th><th class="l" style="width:16%">${k.additive ? 'Share' : ''}</th><th>Spend</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th title="Spend per appointment">CPA</th><th title="Sales as a share of appointments">Closing rate</th><th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th></tr>
+      ${rows.map((r, i) => `<tr class="zrow" data-zrow="${i}" title="Filter to ${esc(r.label)}"><td>${esc(r.label)}</td><td><b>${r.v == null ? '—' : k.fmt(r.v)}</b></td>
+        <td class="l">${k.additive ? `<span class="bar"><i style="width:${Math.max(1, (Math.abs(r.v) / max) * 100)}%"></i></span> <span class="muted">${totalV ? pct(r.v / totalV) : ''}</span>` : ''}</td>${cells(r)}</tr>`).join('') || '<tr><td class="l muted" colspan="11">Nothing in this period for this selection.</td></tr>'}
+      <tr class="total ${k.records ? 'zrow' : ''}" ${k.records ? 'id="z-total" title="List the underlying records"' : ''}><td>Total${k.records ? ' <span class="muted" style="font-weight:400">· view records ›</span>' : ''}</td><td>${totalV == null ? '—' : k.fmt(totalV)}</td><td></td>${cells(T)}</tr></table></div>`}`;
+  close();
+  $$('[data-zdim]', dlg).forEach((b) => (b.onclick = () => { zoom.dim = b.dataset.zdim; drawZoom(); }));
+  $$('[data-zrow]', dlg).forEach((tr) => (tr.onclick = () => { const r = rows[Number(tr.dataset.zrow)]; zoom.f[zoom.dim] = { key: r.key ?? '', label: r.label }; if (next) zoom.dim = next; else zoom.view = k.records ? 'records' : 'breakdown'; drawZoom(); }));
+  if ($('#z-total', dlg)) $('#z-total', dlg).onclick = () => { zoom.view = 'records'; drawZoom(); };
 }
 
 // ---- Projections -----------------------------------------------------------
@@ -394,7 +496,7 @@ async function projections(el) {
   const th = months.map((m) => `<th>${mlabel(m)}${closed(m) ? '' : '*'}</th>`).join('');
 
   el.innerHTML = `
-    <h1>Projections · ${state.year}</h1><p class="sub">Budget is set once a year by channel and does not move. The channel forecast is the official outlook and is re-forecast monthly; campaign projections are the detail underneath, refreshed quarterly.</p>
+    <h1>Maestro <span class="hl">Projections</span> · ${state.year}</h1><p class="sub">Budget is set once a year by channel and does not move. The channel forecast is the official outlook and is re-forecast monthly; campaign projections are the detail underneath, refreshed quarterly.</p>
     <div class="tiles">
       <div class="tile"><div class="k">Annual budget</div><div class="v">${hasBudget ? compact(T.budget) : '—'}</div><div class="d">${hasBudget ? 'Set once, does not move' : 'No budget loaded for ' + state.year}</div></div>
       <div class="tile"><div class="k">Actual to date</div><div class="v">${compact(T.ytd)}</div><div class="d">${hasBudget ? 'Budget to date ' + compact(T.ytdBudget) : closedMonths.length + ' closed months'}</div></div>
@@ -452,12 +554,12 @@ async function projections(el) {
 async function campaigns(el) {
   const list = await api('/api/campaigns?' + scope());
   const brandId = Number(state.brand || meta.brands[0].id), brand = meta.brands.find((b) => b.id === brandId);
-  const locs = meta.locations.filter((l) => l.brand_id === brandId), openMonths = meta.months;
+  const locs = meta.locations.filter((l) => l.brand_id === brandId), openMonths = meta.months.filter((m) => m.slice(0, 4) >= meta.closedThrough.slice(0, 4));
   const waiting = list.filter((c) => c.status === 'pending').length;
   const actions = (c) => c.status === 'pending' ? (state.role === 'approver' ? `<button data-decide="approved" data-id="${c.id}" class="primary">Approve</button> <button data-decide="rejected" data-id="${c.id}">Reject</button>` : '<span class="muted">Waiting for approver</span>')
     : c.status === 'approved' ? `<button data-push="${c.id}" class="primary">Push to CRM</button>` : '';
   el.innerHTML = `
-    <h1>Campaigns</h1><p class="sub">New campaigns start here. A campaign is created in the CRM only after it is approved, so the name is the same everywhere. ${waiting ? `<b>${waiting} waiting for approval.</b>` : ''}</p>
+    <h1>Maestro <span class="hl">Campaigns</span></h1><p class="sub">New campaigns start here. A campaign is created in the CRM only after it is approved, so the name is the same everywhere. ${waiting ? `<b>${waiting} waiting for approval.</b>` : ''}</p>
     <div class="card"><h2>Request a new campaign</h2><p class="sub">For ${esc(brand.name)}. Change the brand filter above to request for another brand.</p>
       <form id="new"><div class="grid2">
         <label>Level 1 <select name="level1_id">${meta.channels.map((ch) => `<optgroup label="${esc(ch.name)}">${opts(meta.level1.filter((l) => l.channel_id === ch.id))}</optgroup>`).join('')}</select></label>
@@ -501,7 +603,7 @@ async function campaigns(el) {
 // ---- Mappings --------------------------------------------------------------
 async function mappings(el) {
   const tabs = { names: 'CRM campaign names', links: 'Spend links', hierarchy: 'Channel and Level 1', brands: 'Brands and regions', changes: 'Changes' };
-  let html = `<h1>Mappings</h1><p class="sub">Tie each CRM campaign name to one campaign, each campaign to a Level 1, and each Level 1 to a Channel.</p>
+  let html = `<h1>Maestro <span class="hl">Mappings</span></h1><p class="sub">Tie each CRM campaign name to one campaign, each campaign to a Level 1, and each Level 1 to a Channel.</p>
     <div class="tabs">${Object.entries(tabs).map(([k, n]) => `<button data-tab="${k}" class="${k === state.mapTab ? 'on' : ''}">${n}</button>`).join('')}</div>`;
   if (state.mapTab === 'names') {
     const names = await api('/api/mappings?' + scope()), open = names.filter((n) => n.status === 'open'), fix = names.filter((n) => n.status === 'fix_in_crm');
@@ -582,7 +684,7 @@ async function mappings(el) {
 async function imports(el) {
   const s = await api('/api/import');
   const size = (n) => (n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.ceil(n / 1e3) + ' KB');
-  el.innerHTML = `<h1>Import</h1><p class="sub">Load extract files from a folder on this computer. Files are read in place; nothing is uploaded anywhere. Import the mappings workbook first.
+  el.innerHTML = `<h1>Maestro <span class="hl">Import</span></h1><p class="sub">Load extract files from a folder on this computer. Files are read in place; nothing is uploaded anywhere. Import the mappings workbook first.
     ${s.mode === 'real' ? 'The app is running on imported data.' : 'The app is running on synthetic demo data, which the first import replaces.'}</p>
     <div class="card"><h2>Import folder</h2><div class="row" style="margin-top:8px"><label style="flex:1">Folder path <input id="i-dir" type="text" value="${esc(s.dir)}" placeholder="Paste the folder that holds your extract files"></label><button id="i-set">Use this folder</button></div></div>
     <div class="card"><h2>Files</h2><p class="sub">${s.dir ? (s.exists ? `${s.files.length} spreadsheet files found.` : 'That folder no longer exists.') : 'Set a folder to see its files.'} Large files can take a few seconds.</p><div class="scroll"><table>

@@ -9,7 +9,7 @@ const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data');
 const FILE = path.join(DIR, 'maestro.db');
 
 export const YEAR = 2026;
-export const YEARS = [YEAR, YEAR + 1];
+export const YEARS = [YEAR - 1, YEAR, YEAR + 1]; // prior year for comparisons, current year, next year for planning
 export const MONTHS = YEARS.flatMap((y) => Array.from({ length: 12 }, (_, i) => `${y}-${String(i + 1).padStart(2, '0')}`));
 export const FX_CAD_USD = 0.70; // one Canadian dollar in US dollars, used wherever the app translates between the two
 // Entity hierarchy: Division → Region → Brand → Market location. Division follows from the region.
@@ -217,7 +217,7 @@ function seed(db) {
   ins('INSERT INTO audit (at, user, action, detail) VALUES (?, ?, ?, ?)').run(new Date().toISOString(), 'system', 'seed', 'Synthetic pilot data generated');
 }
 
-const TABLES = ['spend_day', 'crm_day', 'channel_plan', 'crm_fact', 'crm_name', 'spend', 'gl', 'gl_map', 'entity', 'campaign', 'level1', 'channel', 'location', 'brand'];
+const TABLES = ['record', 'gl_line', 'spend_day', 'crm_day', 'channel_plan', 'crm_fact', 'crm_name', 'spend', 'gl', 'gl_map', 'entity', 'campaign', 'level1', 'channel', 'location', 'brand'];
 export const wipe = (db) => { for (const t of TABLES) db.exec('DELETE FROM ' + t); };
 export const getMode = (db) => db.prepare("SELECT value FROM setting WHERE key = 'mode'").get()?.value || 'synthetic';
 export const setMode = (db, mode) => db.prepare("INSERT INTO setting (key, value) VALUES ('mode', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(mode);
@@ -229,6 +229,14 @@ const DAY_DDL = `CREATE TABLE IF NOT EXISTS spend_day (campaign_id INTEGER NOT N
 CREATE INDEX IF NOT EXISTS spend_day_day ON spend_day (day);
 CREATE TABLE IF NOT EXISTS crm_day (crm_name_id INTEGER NOT NULL, location_id INTEGER NOT NULL, day TEXT NOT NULL, leads REAL NOT NULL DEFAULT 0, appts REAL NOT NULL DEFAULT 0, sales REAL NOT NULL DEFAULT 0, bookings REAL NOT NULL DEFAULT 0, PRIMARY KEY (crm_name_id, location_id, day));
 CREATE INDEX IF NOT EXISTS crm_day_day ON crm_day (day);
+CREATE TABLE IF NOT EXISTS record (id TEXT, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, campaign_id INTEGER, service TEXT, ctype TEXT, status TEXT,
+  clone INTEGER NOT NULL, won INTEGER NOT NULL, lead_day TEXT, appt_day TEXT, closed_day TEXT, amount REAL NOT NULL DEFAULT 0, rep TEXT);
+CREATE INDEX IF NOT EXISTS record_lead ON record (lead_day);
+CREATE INDEX IF NOT EXISTS record_appt ON record (appt_day);
+CREATE INDEX IF NOT EXISTS record_closed ON record (closed_day);
+CREATE TABLE IF NOT EXISTS gl_line (id INTEGER PRIMARY KEY, month TEXT NOT NULL, day TEXT, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, level1_id INTEGER NOT NULL,
+  account TEXT, vendor TEXT, description TEXT, ref TEXT, amount REAL NOT NULL, source TEXT);
+CREATE INDEX IF NOT EXISTS gl_line_month ON gl_line (month);
 CREATE TABLE IF NOT EXISTS cal (day TEXT PRIMARY KEY, month TEXT NOT NULL, week TEXT NOT NULL, mdays INTEGER NOT NULL, dim INTEGER NOT NULL, live INTEGER NOT NULL);`;
 const lastOf = (m) => { const d = new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)), 0); return `${m}-${String(d.getDate()).padStart(2, '0')}`; };
 export const getThrough = (db) => db.prepare("SELECT value FROM setting WHERE key = 'data_through'").get()?.value || lastOf(CLOSED_THROUGH);
@@ -266,7 +274,7 @@ export function openDb({ reset = false } = {}) {
   if (!db.prepare('PRAGMA table_info(brand)').all().some((c) => c.name === 'region')) db.exec('ALTER TABLE brand ADD COLUMN region TEXT');
   assignRegions(db);
   db.exec(DAY_DDL);
-  if (!db.prepare('SELECT 1 FROM cal LIMIT 1').get()) buildCal(db);
+  if (!db.prepare('SELECT 1 FROM cal WHERE day = ?').get(MONTHS[0] + '-01')) buildCal(db); // also rebuilds when the span of years changes
   // Databases created before spend links existed get the column added in place.
   if (!db.prepare('PRAGMA table_info(campaign)').all().some((c) => c.name === 'linked_to')) db.exec('ALTER TABLE campaign ADD COLUMN linked_to INTEGER');
   return db;

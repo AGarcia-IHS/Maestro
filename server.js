@@ -426,6 +426,9 @@ const routes = {
                WHERE k.day BETWEEN ? AND ? AND p.budget <> 0 AND ${inScope('p.brand_id')} ${num(query.location) ? `AND p.location_id = ${num(query.location)}` : ''} GROUP BY p.channel_id`).all(query.from, query.to),
   }),
 
+  // One set of totals for a date range. Used for the prior-year comparison on the KPI cards.
+  'GET /api/totals': ({ query }) => collect(query, 'all', "'all'", "'all'", '1=1').rows[0] || { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 },
+
   // A trend by day, week or month, grouped by channel, by Level 1 within a channel, or by campaign within a Level 1.
   'GET /api/series': ({ query }) => {
     const grain = ['day', 'week', 'month'].includes(query.grain) ? query.grain : 'month', id = num(query.id);
@@ -436,6 +439,64 @@ const routes = {
       out.names = Object.fromEntries(q(`SELECT c.id, c.name, b.code FROM campaign c JOIN brand b ON b.id = c.brand_id WHERE c.id IN (${ids.join(',') || 0})`).all().map((c) => [c.id, SCOPE?.length === 1 ? c.name : `${c.name} · ${c.code}`]));
     }
     return out;
+  },
+
+  // ---- KPI zoom -------------------------------------------------------------
+  // One KPI broken down by brand, market location, service offering or customer type, with optional filters.
+  // Brand and location come from the same figures as the rest of Insights and include spend. Service offering and
+  // customer type exist only on CRM records, so those breakdowns carry outcomes and no spend.
+  'GET /api/zoom': ({ query }) => {
+    need(isDate(query.from) && isDate(query.to) && query.from <= query.to, 'Pick a valid date range');
+    const dim = ['brand', 'location', 'service', 'ctype'].includes(query.dim) ? query.dim : 'brand';
+    const fb = num(query.f_brand), fl = num(query.f_location) || num(query.location);
+    if (fb) SCOPE = SCOPE ? SCOPE.filter((x) => x === fb) : [fb];
+    const hasRecords = !!q('SELECT 1 FROM record LIMIT 1').get();
+    if ((dim === 'brand' || dim === 'location') && !query.f_service && !query.f_ctype) {
+      const key = dim === 'brand' ? ['cp.brand_id', 'lo.brand_id'] : ['s.location_id', 'f.location_id'];
+      return { rows: collect({ ...query, location: fl }, 'all', key[0], key[1], '1=1').rows, hasSpend: true, hasRecords };
+    }
+    const col = { brand: 'r.brand_id', location: 'r.location_id', service: 'r.service', ctype: 'r.ctype' }[dim];
+    const p = { a: query.from, b: query.to, svc: query.f_service || null, ct: query.f_ctype || null };
+    const rows = q(`SELECT ${col} key,
+        SUM(r.clone = 0 AND r.lead_day BETWEEN :a AND :b) leads,
+        SUM(r.clone = 0 AND r.status <> 'not qualified' AND r.appt_day BETWEEN :a AND :b) appts,
+        SUM(r.clone = 0 AND r.won = 1 AND r.closed_day BETWEEN :a AND :b) sales,
+        SUM(CASE WHEN r.won = 1 AND r.closed_day BETWEEN :a AND :b THEN r.amount ELSE 0 END) * ${usdFx()} bookings
+      FROM record r WHERE (r.lead_day BETWEEN :a AND :b OR r.appt_day BETWEEN :a AND :b OR r.closed_day BETWEEN :a AND :b)
+        AND ${inScope('r.brand_id')} ${fl ? `AND r.location_id = ${fl}` : ''} AND (:svc IS NULL OR r.service = :svc) AND (:ct IS NULL OR r.ctype = :ct)
+      GROUP BY 1`).all(p).map((r) => ({ ...r, spend: null }));
+    return { rows, hasSpend: false, hasRecords };
+  },
+
+  // The records behind a KPI total: CRM records for outcomes, ledger lines for spend. format=csv downloads them.
+  'GET /api/records': ({ query }) => {
+    need(isDate(query.from) && isDate(query.to) && query.from <= query.to, 'Pick a valid date range');
+    const fb = num(query.f_brand), fl = num(query.f_location) || num(query.location), csv = query.format === 'csv', limit = csv ? 50000 : 500;
+    if (fb) SCOPE = SCOPE ? SCOPE.filter((x) => x === fb) : [fb];
+    let cols, rows, count, total;
+    if (query.measure === 'spend') {
+      const where = `g.month BETWEEN ? AND ? AND ${inScope('g.brand_id')} ${fl ? `AND g.location_id = ${fl}` : ''}`, args = [query.from.slice(0, 7), query.to.slice(0, 7)];
+      cols = ['Date', 'Period', 'Brand', 'Market location', 'Level 1', 'GL account', 'Vendor', 'Description', 'Reference', 'Ledger', `Amount (${CUR})`];
+      ({ n: count, t: total } = q(`SELECT COUNT(*) n, SUM(g.amount * ${fxSql('b')}) t FROM gl_line g JOIN brand b ON b.id = g.brand_id WHERE ${where}`).get(...args));
+      rows = q(`SELECT g.day, g.month, b.name brand, lo.name location, l.name level1, g.account, g.vendor, g.description, g.ref, g.source, ROUND(g.amount * ${fxSql('b')}, 2) amount
+                FROM gl_line g JOIN brand b ON b.id = g.brand_id JOIN location lo ON lo.id = g.location_id JOIN level1 l ON l.id = g.level1_id
+                WHERE ${where} ORDER BY g.day DESC, g.id LIMIT ${limit}`).all(...args).map((r) => Object.values(r));
+    } else {
+      const on = { leads: ['r.lead_day', 'r.clone = 0'], appts: ['r.appt_day', "r.clone = 0 AND r.status <> 'not qualified'"], sales: ['r.closed_day', 'r.clone = 0 AND r.won = 1'], bookings: ['r.closed_day', 'r.won = 1'] }[query.measure];
+      need(on, 'Records are available for spend, leads, appointments, sales and bookings');
+      const where = `${on[0]} BETWEEN :a AND :b AND ${on[1]} AND ${inScope('r.brand_id')} ${fl ? `AND r.location_id = ${fl}` : ''} AND (:svc IS NULL OR r.service = :svc) AND (:ct IS NULL OR r.ctype = :ct)`;
+      const p = { a: query.from, b: query.to, svc: query.f_service || null, ct: query.f_ctype || null };
+      cols = ['Lead created', 'Appointment booked', 'Closed', 'Brand', 'Market location', 'Campaign', 'Level 1', 'Service offering', 'Customer type', 'Status', 'Additional project', 'Sales rep', `Contract (${CUR})`, 'Record ID'];
+      ({ n: count, t: total } = q(`SELECT COUNT(*) n, SUM(r.amount) * ${usdFx()} t FROM record r WHERE ${where}`).get(p));
+      rows = q(`SELECT r.lead_day, r.appt_day, r.closed_day, b.name brand, lo.name location, c.name campaign, l.name level1, r.service, r.ctype, r.status, CASE r.clone WHEN 1 THEN 'Yes' ELSE '' END clone, r.rep, ROUND(r.amount * ${usdFx()}, 2) amount, r.id
+                FROM record r JOIN brand b ON b.id = r.brand_id JOIN location lo ON lo.id = r.location_id LEFT JOIN campaign c ON c.id = r.campaign_id LEFT JOIN level1 l ON l.id = c.level1_id
+                WHERE ${where} ORDER BY ${on[0]} DESC LIMIT ${limit}`).all(p).map((r) => Object.values(r));
+    }
+    if (csv) {
+      const cell = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+      return { csv: [cols, ...rows].map((r) => r.map(cell).join(',')).join('\r\n'), filename: `maestro-${query.measure}-${query.from}-to-${query.to}.csv` };
+    }
+    return { cols, rows, count, total: total || 0, shown: rows.length };
   },
 
   'GET /api/audit': () => q('SELECT * FROM audit ORDER BY id DESC LIMIT 200').all(),
@@ -456,9 +517,10 @@ http.createServer(async (req, res) => {
   if (handler) {
     try {
       const body = req.method === 'POST' ? await readBody(req) : {};
-      CUR = req.headers['x-maestro-currency'] === 'CAD' ? 'CAD' : 'USD';
+      CUR = (req.headers['x-maestro-currency'] || url.searchParams.get('cur')) === 'CAD' ? 'CAD' : 'USD';
       SCOPE = scopeOf({ ...Object.fromEntries(url.searchParams), ...(req.method === 'POST' ? { brand: body.brand, region: body.region, division: body.division } : {}) });
       const result = handler({ query: Object.fromEntries(url.searchParams), body, user: req.headers['x-maestro-user'] || 'Demo user', role: req.headers['x-maestro-role'] || 'marketer' });
+      if (result?.csv != null) { res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${result.filename}"`, 'Cache-Control': 'no-store' }); return res.end('\ufeff' + result.csv); }
       send(200, JSON.stringify(result));
     } catch (e) {
       if (!(e instanceof Bad)) console.error(e);
