@@ -647,7 +647,7 @@ const routes = {
     const rules = new Map(q('SELECT r.*, c.name campaign FROM gl_rule r JOIN campaign c ON c.id = r.campaign_id WHERE r.brand_id = ?').all(brand).map((r) => [`${r.level1_id}|${r.vendor}`, r]));
     const generic = new Set(['google', 'other', 'website', 'internet', 'referral', 'email', 'radio', 'tv', 'events', 'event', 'facebook', 'print', 'direct mail', 'social media', 'sponsorship', 'sponsorships', 'lsa', 'organic']);
     const out = [...groups.values()].map((g) => {
-      const open = g.amount - g.assigned - g.covered, rule = g.vendor_key ? rules.get(g.key) : null;
+      const open = g.amount - g.assigned - g.covered, rule = rules.get(g.key);
       let suggest = null;
       if (!rule && open > 0.5) {
         const active = camps.filter((c) => c.level1_id === g.level1_id && c.leads > 0);
@@ -678,14 +678,16 @@ const routes = {
   },
 
   // A vendor rule: every line from this vendor in this Level 1 belongs to one CRM campaign, now and on future imports.
+  // With no vendor given, the rule is for the lines in that Level 1 that carry no vendor name.
   // Sending no campaign removes the rule and the assignments it made.
   'POST /api/ledger/rule': ({ body, user }) => tx(() => {
     const brand = q('SELECT * FROM brand WHERE id = ?').get(num(body.brand_id)), l1 = q('SELECT * FROM level1 WHERE id = ?').get(num(body.level1_id)), vendor = norm(body.vendor || '');
-    need(brand && l1 && vendor, 'A rule needs a brand, a Level 1 and a vendor name');
+    need(brand && l1, 'A rule needs a brand and a Level 1');
+    const who = body.vendor || 'lines with no vendor name';
     if (!body.campaign_id) {
       q('DELETE FROM gl_rule WHERE brand_id = ? AND level1_id = ? AND vendor = ?').run(brand.id, l1.id, vendor);
       applyRules(db); rebuildUnallocated(db);
-      audit(user, 'ledger: rule removed', `${brand.name} · ${l1.name} · ${body.vendor}`);
+      audit(user, 'ledger: rule removed', `${brand.name} · ${l1.name} · ${who}`);
       return { ok: true };
     }
     const c = q("SELECT * FROM campaign WHERE id = ? AND brand_id = ? AND source IN ('crm', 'manual')").get(num(body.campaign_id), brand.id);
@@ -693,7 +695,7 @@ const routes = {
     q(`INSERT INTO gl_rule (brand_id, level1_id, vendor, campaign_id, by_user, at) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT (brand_id, level1_id, vendor) DO UPDATE SET campaign_id = excluded.campaign_id, by_user = excluded.by_user, at = excluded.at`).run(brand.id, l1.id, vendor, c.id, user, new Date().toISOString());
     const n = applyRules(db); rebuildUnallocated(db);
-    audit(user, 'ledger: vendor rule', `${brand.name} · ${l1.name} · ${body.vendor} → ${c.name}`);
+    audit(user, 'ledger: vendor rule', `${brand.name} · ${l1.name} · ${who} → ${c.name}`);
     return { ok: true, lines: n };
   }),
 
