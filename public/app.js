@@ -77,9 +77,9 @@ const addDays = (d, n) => { const dt = toDate(d); dt.setDate(dt.getDate() + n); 
 const monthStart = (m) => m + '-01';
 const monthEnd = (m) => iso(new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)), 0, 12));
 const niceDay = (d, withYear = true) => toDate(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', ...(withYear ? { year: 'numeric' } : {}) });
-const GRAINS = { month: 'Months', week: 'Weeks', day: 'Days' };
+const GRAINS = { day: 'Day', week: 'Week', month: 'Month' };
 // How a bucket key reads on the axis and in a tooltip, and the dates it covers.
-const bucketLabel = { month: (k) => mlabel(k), week: (k) => niceDay(k, false), day: (k) => niceDay(k, false) };
+const bucketLabel = { month: (k, bw = 99) => (bw >= 70 ? `${mlabel(k)} ${k.slice(0, 4)}` : bw < 30 ? mlabel(k)[0] : mlabel(k)), week: (k) => niceDay(k, false), day: (k) => niceDay(k, false) };
 const bucketTitle = { month: (k) => `${mlabel(k)} ${k.slice(0, 4)}`, week: (k) => `Week of ${niceDay(k)}`, day: (k) => toDate(k).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) };
 const bucketSpan = { month: (k) => [monthStart(k), monthEnd(k)], week: (k) => [k, addDays(k, 6)], day: (k) => [k, k] };
 
@@ -87,44 +87,69 @@ const bucketSpan = { month: (k) => [monthStart(k), monthEnd(k)], week: (k) => [k
 // Stacked bars drawn at the real pixel width of their container and redrawn when that changes.
 // A click on a bar and a double-click on a colour are told apart by a short delay.
 function stackedChart(host, opts) {
-  const { buckets, series, markers, fmt, label, title, onBucket, onSeries, hint } = opts;
-  const W = Math.max(300, Math.round(host.clientWidth || 960)), H = Math.round(Math.min(400, Math.max(210, W * 0.3)));
-  const L = W < 520 ? 44 : 56, R = 12, T = 12, B = 30, pw = W - L - R, ph = H - T - B;
+  const { buckets, series, markers, fmt, label, title, onBucket, onSeries, hint, line, compare, compareName } = opts;
+  const W = Math.max(300, Math.round(host.clientWidth || 960)), H = Math.round(Math.min(440, Math.max(230, W * 0.34)));
+  const L = W < 520 ? 46 : 62, R = 14, T = 24, B = 32, pw = W - L - R, ph = H - T - B, n = Math.max(1, buckets.length);
   const totals = buckets.map((_, i) => series.reduce((a, s) => a + Math.max(0, s.values[i]), 0));
-  const max = Math.max(1, ...totals, ...(markers || []));
-  const step = (() => { const raw = max / 4, p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 2.5, 5, 10].map((k) => k * p).find((s) => s >= raw); })();
-  const top = Math.ceil(max / step) * step, y = (v) => T + ph - (v / top) * ph, bw = pw / Math.max(1, buckets.length), w = Math.max(1, Math.min(72, bw * (bw < 6 ? 0.85 : 0.62)));
-  const every = Math.max(1, Math.ceil(46 / bw)), gap = w >= 6 ? 2 : 0, stacks = [];
-  let svg = '';
-  for (let v = 0; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${v ? 'var(--grid)' : 'var(--axis)'}"/><text x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`;
+  const peak = line ? Math.max(0, ...series.flatMap((s) => s.values)) : Math.max(0, ...totals);
+  const max = Math.max(1e-9, peak, ...(markers || []), ...(compare || []).filter((v) => v != null));
+  const step = (() => { const raw = max / 5, p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 2.5, 5, 10].map((k) => k * p).find((s) => s >= raw); })();
+  const top = Math.ceil((max * (line ? 1.02 : 1.06)) / step) * step, y = (v) => T + ph - (v / top) * ph, bw = pw / n, w = Math.max(1, Math.min(150, bw * (bw < 6 ? 0.85 : 0.72)));
+  const cx = (i) => L + bw * i + bw / 2, every = Math.max(1, Math.ceil(58 / bw)), gap = w >= 6 ? 1 : 0, stacks = [];
+  let svg = `<rect x="${L}" y="${T}" width="${pw}" height="${ph}" fill="none" stroke="var(--grid)"/>`;
+  for (let v = 0; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${v ? 'var(--grid)' : 'var(--axis)'}"/><text class="ax" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`;
+  if (n <= 62) for (let i = 1; i < n; i++) svg += `<line x1="${L + bw * i}" x2="${L + bw * i}" y1="${T}" y2="${T + ph}" stroke="var(--grid)"/>`;
   svg += `<rect class="hov" x="0" y="${T}" width="${bw}" height="${ph}" fill="var(--ink)" opacity="0" pointer-events="none"/>`;
-  buckets.forEach((b, i) => {
+  if (line) {
+    // Days read better as lines: one per series, with a point on each day when there is room.
+    for (const s of series) {
+      svg += `<path d="M${s.values.map((v, i) => `${cx(i).toFixed(1)},${y(Math.max(0, v)).toFixed(1)}`).join(' L')}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      if (n <= 45) svg += s.values.map((v, i) => `<circle cx="${cx(i)}" cy="${y(Math.max(0, v))}" r="3" fill="${s.color}" stroke="var(--surface)" stroke-width="1.5"/>`).join('');
+    }
+    buckets.forEach((_, i) => stacks.push(series.map((s) => ({ id: s.id, at: y(Math.max(0, s.values[i])) }))));
+  } else buckets.forEach((b, i) => {
     const x = L + bw * i + (bw - w) / 2, live = series.filter((s) => s.values[i] > 0), segs = [];
     let base = 0;
     live.forEach((s, k) => {
-      const v = s.values[i], h = Math.max(0, y(base) - y(base + v) - (k < live.length - 1 ? gap : 0)), r = k === live.length - 1 ? Math.min(4, h, w / 2) : 0, yt = y(base) - h;
+      const v = s.values[i], h = Math.max(0, y(base) - y(base + v) - (k < live.length - 1 ? gap : 0)), r = k === live.length - 1 ? Math.min(3, h, w / 2) : 0, yt = y(base) - h;
       svg += `<path d="M${x},${yt + h}V${yt + r}Q${x},${yt} ${x + r},${yt}H${x + w - r}Q${x + w},${yt} ${x + w},${yt + r}V${yt + h}Z" fill="${s.color}"/>`;
       segs.push({ id: s.id, y0: yt, y1: yt + h + gap });
       base += v;
     });
     stacks.push(segs);
     if (markers && markers[i] > 0) svg += `<line x1="${x - 5}" x2="${x + w + 5}" y1="${y(markers[i])}" y2="${y(markers[i])}" stroke="var(--ink)" stroke-width="2"/>`;
-    if (i % every === 0) svg += `<text x="${L + bw * i + bw / 2}" y="${H - 10}" text-anchor="middle">${bw < 34 && every === 1 ? label(b)[0] : label(b)}</text>`;
+    if (bw >= 38 && totals[i] > 0) svg += `<text class="tot" x="${cx(i)}" y="${y(totals[i]) - 6}" text-anchor="middle">${fmt(totals[i])}</text>`;
+  });
+  // The same period a year earlier, as a dashed line over the bars.
+  if (compare && compare.some((v) => v != null)) {
+    const pts = compare.map((v, i) => (v == null ? null : [cx(i), y(v)])).filter(Boolean);
+    svg += `<path d="M${pts.map((p) => p.map((v) => v.toFixed(1)).join(',')).join(' L')}" fill="none" stroke="var(--py)" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round"/>`;
+    if (n <= 62) svg += pts.map(([px, py]) => `<circle cx="${px}" cy="${py}" r="4" fill="var(--py)" stroke="var(--surface)" stroke-width="2"/>`).join('');
+  }
+  buckets.forEach((b, i) => {
+    if (i % every === 0) svg += `<text class="ax" x="${cx(i)}" y="${H - 10}" text-anchor="middle">${label(b, bw)}</text>`;
     svg += `<rect data-i="${i}" x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="transparent" style="cursor:${onBucket || onSeries ? 'pointer' : 'default'}"/>`;
   });
-  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Stacked bars over time">${svg}</svg><div class="tip"></div>`;
+  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${line ? 'Lines' : 'Stacked bars'} over time">${svg}</svg><div class="tip"></div>`;
   const tip = $('.tip', host), hov = $('.hov', host), svgEl = $('svg', host);
-  const segAt = (e) => { const i = e.target.dataset?.i; if (i == null) return null; const py = (e.clientY - svgEl.getBoundingClientRect().top) * (H / svgEl.getBoundingClientRect().height); return stacks[i].find((s) => py >= s.y0 && py <= s.y1) || null; };
+  const segAt = (e) => {
+    const i = e.target.dataset?.i; if (i == null) return null;
+    const box = svgEl.getBoundingClientRect(), py = (e.clientY - box.top) * (H / box.height);
+    if (!line) return stacks[i].find((s) => py >= s.y0 && py <= s.y1) || null;
+    const near = stacks[i].map((s) => ({ ...s, d: Math.abs(s.at - py) })).sort((a, b) => a.d - b.d)[0];
+    return near && near.d <= 14 ? near : null;
+  };
   let timer;
   host.onclick = (e) => { const i = e.target.dataset?.i; if (i == null || !onBucket) return; clearTimeout(timer); timer = setTimeout(() => onBucket(buckets[i]), 260); };
   host.ondblclick = (e) => { clearTimeout(timer); const s = segAt(e); if (s && onSeries) onSeries(s.id); };
   host.onmousemove = (e) => {
     const i = e.target.dataset?.i; if (i == null) { hov.setAttribute('opacity', 0); return (tip.style.display = 'none'); }
-    hov.setAttribute('x', L + bw * i); hov.setAttribute('opacity', 0.06);
+    hov.setAttribute('x', L + bw * i); hov.setAttribute('opacity', 0.05);
     const at = segAt(e);
     tip.innerHTML = `<b>${title(buckets[i])}</b>` +
-      series.filter((s) => s.values[i]).map((s) => `<div ${at?.id === s.id ? 'style="font-weight:650"' : ''}><span><i class="dot" style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.values[i])}</span></div>`).join('') +
+      series.filter((s) => s.values[i]).map((s) => `<div ${at?.id === s.id ? 'style="font-weight:700"' : ''}><span><i class="dot" style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.values[i])}</span></div>`).join('') +
       `<div><span><b style="display:inline">Total</b></span><span><b style="display:inline">${fmt(totals[i])}</b></span></div>` +
+      (compare && compare[i] != null ? `<div><span><i class="dot" style="background:var(--py);border-radius:50%"></i>${compareName || 'Prior year'}</span><span>${fmt(compare[i])}</span></div>` : '') +
       (markers ? `<div><span>Budget</span><span>${fmt(markers[i])}</span></div>` : '') + (hint ? `<div style="margin-top:4px"><span>${hint}</span></div>` : '');
     const box = host.getBoundingClientRect(); tip.style.display = 'block';
     tip.style.left = Math.max(0, Math.min(e.clientX - box.left + 14, box.width - tip.offsetWidth - 4)) + 'px'; tip.style.top = Math.max(0, e.clientY - box.top - 20) + 'px';
@@ -147,7 +172,7 @@ function pivot(data, measure, names, colorOf) {
 }
 
 // ---- Insights --------------------------------------------------------------
-const MEASURES = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', bookings: 'Bookings $' };
+const MEASURES = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', sales: 'Sales', bookings: 'Bookings $' };
 const rangeQuery = () => scope() + `&from=${state.dFrom}&to=${state.dTo}`;
 let ins = null; // what the Insights screen last loaded
 const yearBack = (d) => { const y = Number(d.slice(0, 4)) - 1, rest = d.slice(4) === '-02-29' ? '-02-28' : d.slice(4); return y + rest; };
@@ -162,9 +187,10 @@ async function insights(el) {
   if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Projections screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
   if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
   const pyFrom = yearBack(state.dFrom), pyTo = yearBack(state.dTo), hasPy = pyFrom >= meta.months[0] + '-01';
-  const [f, range, series, py] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
-    hasPy ? api(`/api/totals?${scope()}&from=${pyFrom}&to=${pyTo}`) : null]);
-  facts = f; ins = { range, series, py, pyFrom, pyTo };
+  const [f, range, series, py, pySeries] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
+    hasPy ? api(`/api/totals?${scope()}&from=${pyFrom}&to=${pyTo}`) : null,
+    hasPy ? api(`/api/series?${scope()}&from=${pyFrom}&to=${pyTo}&grain=${state.grain}&group=channel`) : null]);
+  facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo };
   drawInsights(el);
 }
 function drawInsights(el) {
@@ -268,10 +294,11 @@ function drawInsights(el) {
     <div class="tiles">${tiles.map(([m, val, d]) => `<div class="tile kpi"><div class="kpi-top"><span class="k">${KPIS[m].name}<span class="help" title="${esc(KPIS[m].help)}">?</span></span><button class="zoom" data-zoom="${m}" title="Break ${KPIS[m].name} down by brand, market location, service offering and customer type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Zoom</button></div><div class="v">${val}</div><div class="d">${d}</div>${py[m]}${spark(m)}</div>`).join('')}</div>
     ${ins.py ? `<p class="sub" style="margin:-6px 0 14px">VS. PY compares with ${niceDay(ins.pyFrom)} to ${niceDay(ins.pyTo)}. Brands that joined part-way through that period have only part of it to compare against, and spend then came from the ledger alone.</p>` : ''}
     <div class="card">
-      <div class="row" style="justify-content:space-between"><div><h2>${MEASURES[state.measure]} by channel, by ${state.grain}</h2><p class="sub" style="margin:0">${rangeText}. Click a bar to zoom into it; double-click a colour, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
-      <div class="row"><div class="seg" aria-label="Chart interval">${Object.entries(GRAINS).map(([k, n]) => `<button data-grain="${k}" class="${k === state.grain ? 'on' : ''}">${n}</button>`).join('')}</div>
-      <div class="seg" aria-label="Measure">${Object.entries(MEASURES).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div></div>
-      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}</div>
+      <div class="row" style="justify-content:space-between"><div><h2>${MEASURES[state.measure]} by channel, by ${state.grain}</h2><p class="sub" style="margin:0">${rangeText}. ${state.grain === 'day' ? 'Days are drawn as a line per channel. Click a day to focus on it; double-click a line' : 'Click a bar to zoom into it; double-click a colour'}, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
+      </div>
+      <div class="row chart-ctl"><div class="row"><span class="ctl-l">Stage</span><div class="seg pills" aria-label="Measure">${Object.entries(MEASURES).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div>
+      <div class="row"><span class="ctl-l">View by</span><div class="seg upper" aria-label="Chart interval">${Object.entries(GRAINS).map(([k, n]) => `<button data-grain="${k}" class="${k === state.grain ? 'on' : ''}">${n}</button>`).join('')}</div></div></div>
+      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${ins.pySeries && state.grain !== 'day' ? '<span class="lg-py"><i></i>Same period last year</span>' : ''}</div>
       <div class="chart" id="chart"></div>${dayNote}
     </div>
     <div class="card"><h2>Channel and Level 1 performance</h2><p class="sub">${rangeText}. Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
@@ -281,8 +308,15 @@ function drawInsights(el) {
   const series = pivot(ins.series, state.measure, (id) => ch[id]?.name || 'Other', (id) => COLORS[chIndex.get(id) ?? 8]).sort((a, b) => chIndex.get(a.id) - chIndex.get(b.id)).filter((s) => !state.hiddenCh.has(s.id));
   const g = state.grain, reload = () => insights(el);
   const setRange = (a, b, keepPrev) => { if (!keepPrev) state.prevRange = null; state.dFrom = a; state.dTo = b > through ? through : b; if (state.dFrom > state.dTo) state.dFrom = state.dTo; reload(); };
+  // Prior-year totals for the same intervals, drawn as a dashed line. Days are lines per channel, so no total is overlaid there.
+  const pyLine = ins.pySeries && g !== 'day' ? (() => {
+    const idx = new Map(ins.pySeries.buckets.map((k, i) => [k, i])), vals = ins.pySeries.buckets.map(() => 0);
+    for (const r of ins.pySeries.rows) if (r.key != null && !state.hiddenCh.has(r.key)) vals[idx.get(r.bucket)] += r[state.measure] || 0;
+    return ins.series.buckets.map((_, i) => (i < vals.length ? vals[i] : null));
+  })() : null;
   stackedChart($('#chart'), {
     buckets: ins.series.buckets, series, fmt: state.measure === 'spend' || state.measure === 'bookings' ? compact : int,
+    line: g === 'day', compare: pyLine, compareName: 'Same period last year',
     label: bucketLabel[g], title: bucketTitle[g], hint: g === 'day' ? 'Click to focus this day · double-click a colour to break it down' : 'Click to zoom in · double-click a colour to break it down',
     // Zooming remembers where you came from, and steps the interval down so there is something to see.
     onBucket: (k) => { state.prevRange ||= { from: state.dFrom, to: state.dTo, grain: state.grain }; const [a, b] = bucketSpan[g](k); if (g !== 'day') state.grain = 'day'; setRange(a < meta.months[0] + '-01' ? meta.months[0] + '-01' : a, b, true); },
@@ -341,7 +375,7 @@ async function openDrill(path) {
       <div class="chart" id="d-chart"></div>
       <div class="scroll" style="max-height:38vh;overflow-y:auto;margin-top:12px"><table><tr><th>${byCampaign ? 'Campaign' : 'Level 1'}</th><th>Spend</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>ROAS</th></tr>
         ${all.map((s) => row(s)).join('') || '<tr><td class="l muted" colspan="9">Nothing in this period.</td></tr>'}${all.length > 1 ? row({ id: 't', name: 'Total', total: T }, 'total') : ''}</table></div>`;
-    stackedChart($('#d-chart', dlg), { buckets: data.buckets, series: chart, fmt, label: bucketLabel[state.grain], title: bucketTitle[state.grain], hint: byCampaign ? '' : 'Double-click a colour to see its campaigns',
+    stackedChart($('#d-chart', dlg), { buckets: data.buckets, series: chart, fmt, line: state.grain === 'day', label: bucketLabel[state.grain], title: bucketTitle[state.grain], hint: byCampaign ? '' : 'Double-click a colour to see its campaigns',
       onSeries: byCampaign ? null : (id) => id !== 'other' && openDrill([...path, { group: 'campaign', id, name: l1[id] }]) });
     $('#d-close', dlg).onclick = () => dlg.close();
     $$('[data-dmeasure]', dlg).forEach((b) => (b.onclick = () => { state.measure = b.dataset.dmeasure; draw(); if (location.hash.slice(1) === 'insights' || !location.hash) drawInsights($('#view')); }));
