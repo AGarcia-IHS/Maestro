@@ -257,3 +257,15 @@ dialog#drill { border-radius: 14px; }
 tr.cp.un td { font-style: italic; }
 tr.ch[data-pch] td { cursor: pointer; }
 td.cell input { width: 92px; }
+
+/* ---- move between campaigns ---- */
+.move { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); gap: clamp(14px, 2vw, 28px); margin-top: 14px; }
+@media (max-width: 760px) { .move { grid-template-columns: 1fr; } }
+.move label { display: flex; flex-direction: column; gap: 4px; font-weight: 700; color: var(--ink); font-size: 13px; }
+.move select, .move input, .move textarea { width: 100%; font-weight: 500; }
+.move textarea { border: 1px solid #d5dde6; border-radius: 8px; padding: 8px 10px; font: inherit; resize: vertical; }
+.issues { margin-top: 8px; color: var(--critical); font-size: 13px; display: grid; gap: 3px; }
+
+/* ---- ledger line split editor ---- */
+.split { display: grid; gap: 8px; }
+.split .row { align-items: center; }

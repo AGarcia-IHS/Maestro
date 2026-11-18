@@ -13,11 +13,11 @@ const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct
 const mlabel = (m) => MON[Number(m.slice(5)) - 1];
 const COLORS = new Proxy([], { get: (_, i) => `var(--s${Math.min(9, Number(i) + 1)})` }); // channel colour by position; extras fold to grey
 const PLATFORMS = ['google_ads', 'bing_ads', 'meta_ads', 'active_prospect'];
-const PLATFORM_NAME = { google_ads: 'Google Ads', bing_ads: 'Bing Ads', meta_ads: 'Meta', active_prospect: 'Active Prospect' };
+const PLATFORM_NAME = { google_ads: 'Google Ads', bing_ads: 'Bing Ads', meta_ads: 'Meta', active_prospect: 'Active Prospect', gl_assigned: 'Ledger' };
 const ROLES = { marketer: 'Marketing manager (demo)', approver: 'Approver (demo)', finance: 'Finance (demo)' };
 
 const saved = (() => { try { return localStorage.getItem('maestro-currency'); } catch { return null; } })();
-const state = { pMeasure: 'spend', pBasis: 't3', pOpen: new Set(), grain: 'month', dateMode: 'months', dFrom: '', dTo: '', rangeYear: '', prevRange: null, division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
+const state = { ledger: { show: 'open', q: '' }, vsMode: 'budget', chartMode: 'channel', pMeasure: 'spend', pBasis: 't3', pOpen: new Set(), grain: 'month', dateMode: 'months', dFrom: '', dTo: '', rangeYear: '', prevRange: null, division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
 let meta, facts;
 
 async function api(path, body) {
@@ -191,6 +191,7 @@ async function insights(el) {
     hasPy ? api(`/api/totals?${scope()}&from=${pyFrom}&to=${pyTo}`) : null,
     hasPy ? api(`/api/series?${scope()}&from=${pyFrom}&to=${pyTo}&grain=${state.grain}&group=channel`) : null]);
   facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo };
+  if (state.chartMode === 'compare') ins.plan = await api(`/api/projections?${scope()}&year=${state.year}`);
   drawInsights(el);
 }
 function drawInsights(el) {
@@ -211,6 +212,13 @@ function drawInsights(el) {
   const tot = rows.reduce((t, r) => add(t, r.t), zero());
   const budgetOf = (chId) => ins.range.budget.reduce((a, p) => a + (chId == null || p.channel_id === chId ? p.budget : 0), 0);
   tot.budget = budgetOf();
+  // The table can set spend against the fixed budget or against the current projection.
+  const vsPlan = state.vsMode === 'plan', vsName = vsPlan ? 'Projection' : 'Budget';
+  const planOf = (chId) => ins.range.plan.reduce((a, p) => a + (chId == null || p.channel_id === chId ? p.plan : 0), 0);
+  const cmpCh = (chId) => (vsPlan ? planOf(chId) : budgetOf(chId));
+  const l1Budget = new Map(ins.range.budgetL1.map((b) => [b.level1_id, b.budget]));
+  // Projections are held by channel, so a Level 1's projection is its budget scaled by how far its channel has moved from budget.
+  const cmpL1 = (l) => { const b = l1Budget.get(l.id) || 0, chB = budgetOf(l.channel_id); return !vsPlan ? b : chB > 0 ? b * (planOf(l.channel_id) / chB) : 0; };
   const blended = tot.actual ? tot.bookings / tot.actual : 0;
   const weak = (r) => !r.c.source.startsWith('gl_') && r.t.leads > 0 && r.t.actual > tot.actual * 0.01 && r.t.bookings / r.t.actual < blended * 0.5;
   const v = tot.budget ? tot.actual / tot.budget - 1 : 0;
@@ -245,7 +253,7 @@ function drawInsights(el) {
   const feedNote = starts.length && state.dFrom <= starts.at(-1)[1]
     ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${niceDay(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier periods campaign-level CPL and CPA read lower, and ROAS higher, than they really were. Level 1 and channel figures are unaffected.</p>` : '';
   const dayNote = wholeMonths && state.grain === 'month' ? '' : `<p class="sub" style="margin:8px 0 0">Note: ad-platform spend and CRM outcomes are shown on the day they happened. Ledger-only spend has no meaningful day, so each month's amount is spread evenly across that month's days; part-month and weekly figures for it are estimates.</p>`;
-  const head = '<tr><th>Channel / Level 1 / Campaign</th><th>Spend</th><th>Budget</th><th>Var</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>Close %</th><th>ROAS</th><th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th><th class="l">Flag</th></tr>';
+  const head = '<tr><th>Channel / Level 1 / Campaign</th><th>Spend</th><th>' + vsName + '</th><th>Var</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>Close %</th><th>ROAS</th><th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th><th class="l">Flag</th></tr>';
   const line = (cls, key, label, t, flag = '') => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td><td>${money(t.actual)}</td><td>${t.budget ? money(t.budget) : '—'}</td>
     <td class="${t.budget && t.actual > t.budget ? 'down' : ''}">${ratio(t.actual - t.budget, t.budget, (x) => (x > 0 ? '+' : '') + pct(x))}</td><td>${int(t.leads)}</td><td>${int(t.appts)}</td><td>${int(t.sales)}</td><td>${money(t.bookings)}</td>
     <td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td>${ratio(t.bookings, t.actual, (x) => x.toFixed(1) + 'x')}</td><td>${t.actual > 0 ? ratio(t.actual, t.bookings, pct) : '—'}</td><td class="l">${flag}</td></tr>`;
@@ -253,12 +261,12 @@ function drawInsights(el) {
   meta.channels.forEach((c, ci) => {
     const inCh = rows.filter((r) => r.c.channel.id === c.id); if (!inCh.length) return;
     const chOpen = !state.open.has('c' + c.id); // channels start expanded
-    body += line('ch', 'c' + c.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}`, Object.assign(inCh.reduce((t, r) => add(t, r.t), zero()), { budget: budgetOf(c.id) }));
+    body += line('ch', 'c' + c.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}`, Object.assign(inCh.reduce((t, r) => add(t, r.t), zero()), { budget: cmpCh(c.id) }));
     if (!chOpen) return;
     for (const l of meta.level1.filter((x) => x.channel_id === c.id)) {
       const inL = inCh.filter((r) => r.c.level1.id === l.id); if (!inL.length) continue;
       const lOpen = state.open.has('l' + l.id), nWeak = inL.filter(weak).length;
-      body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, inL.reduce((t, r) => add(t, r.t), zero()), nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '');
+      body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, Object.assign(inL.reduce((t, r) => add(t, r.t), zero()), { budget: cmpL1(l) }), nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '');
       if (lOpen) for (const r of inL.sort((a, b) => b.t.actual - a.t.actual)) {
         // A campaign fed by linked ad-platform campaigns opens to show them: the lowest level of third-party detail.
         const srcKey = r.c.sources ? 's' + r.c.id : '', srcOpen = srcKey && state.open.has(srcKey);
@@ -272,7 +280,7 @@ function drawInsights(el) {
     }
   });
   if (un.leads) body += line('l1', '', 'Not mapped to a campaign', un, '<a href="#mappings">Map names</a>');
-  body += line('total', '', 'Total', Object.assign(add({ ...tot }, un), { budget: tot.budget }));
+  body += line('total', '', 'Total', Object.assign(add({ ...tot }, un), { budget: cmpCh() }));
 
   const through = meta.dataThrough, months = meta.months.filter((m) => m <= through.slice(0, 7));
   const monthOpts = (sel) => months.map((m) => `<option ${m === sel ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('');
@@ -294,14 +302,17 @@ function drawInsights(el) {
     <div class="tiles">${tiles.map(([m, val, d]) => `<div class="tile kpi"><div class="kpi-top"><span class="k">${KPIS[m].name}<span class="help" title="${esc(KPIS[m].help)}">?</span></span><button class="zoom" data-zoom="${m}" title="Break ${KPIS[m].name} down by brand, market location, service offering and customer type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Zoom</button></div><div class="v">${val}</div><div class="d">${d}</div>${py[m]}${spark(m)}</div>`).join('')}</div>
     ${ins.py ? `<p class="sub" style="margin:-6px 0 14px">VS. PY compares with ${niceDay(ins.pyFrom)} to ${niceDay(ins.pyTo)}. Brands that joined part-way through that period have only part of it to compare against, and spend then came from the ledger alone.</p>` : ''}
     <div class="card">
-      <div class="row" style="justify-content:space-between"><div><h2>${MEASURES[state.measure]} by channel, by ${state.grain}</h2><p class="sub" style="margin:0">${rangeText}. ${state.grain === 'day' ? 'Days are drawn as a line per channel. Click a day to focus on it; double-click a line' : 'Click a bar to zoom into it; double-click a colour'}, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
+      <div class="row" style="justify-content:space-between"><div><h2>${state.chartMode === 'compare' ? `${MEASURES[state.measure]}: actual vs budget vs projection, by month` : `${MEASURES[state.measure]} by channel, by ${state.grain}`}</h2><p class="sub" style="margin:0">${rangeText}. ${state.grain === 'day' ? 'Days are drawn as a line per channel. Click a day to focus on it; double-click a line' : 'Click a bar to zoom into it; double-click a colour'}, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
+      <div class="seg" aria-label="Chart type"><button data-cmode="channel" class="${state.chartMode === 'channel' ? 'on' : ''}">${MEASURES[state.measure]} by channel</button><button data-cmode="compare" class="${state.chartMode === 'compare' ? 'on' : ''}">${MEASURES[state.measure]} comparison</button></div>
       </div>
       <div class="row chart-ctl"><div class="row"><span class="ctl-l">Stage</span><div class="seg pills" aria-label="Measure">${Object.entries(MEASURES).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div>
       <div class="row"><span class="ctl-l">View by</span><div class="seg upper" aria-label="Chart interval">${Object.entries(GRAINS).map(([k, n]) => `<button data-grain="${k}" class="${k === state.grain ? 'on' : ''}">${n}</button>`).join('')}</div></div></div>
-      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${ins.pySeries && state.grain !== 'day' ? '<span class="lg-py"><i></i>Same period last year</span>' : ''}</div>
+      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${ins.pySeries && state.grain !== 'day' && state.chartMode !== 'compare' ? '<span class="lg-py"><i></i>Same period last year</span>' : ''}</div>
       <div class="chart" id="chart"></div>${dayNote}
     </div>
-    <div class="card"><h2>Channel and Level 1 performance</h2><p class="sub">${rangeText}. Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
+    <div class="card"><div class="row" style="justify-content:space-between"><h2>Channel and Level 1 performance</h2>
+      <div class="row"><span class="ctl-l">Spend against</span><div class="seg upper"><button data-vs="budget" class="${vsPlan ? '' : 'on'}">Budget</button><button data-vs="plan" class="${vsPlan ? 'on' : ''}">Projection</button></div></div></div>
+      <p class="sub">${rangeText}. ${vsPlan ? 'The Projection column is the current plan for these dates: hand-entered projections where they exist, otherwise the budget. Level 1 projections follow their channel.' : 'The Budget column is the budget as loaded, by channel and Level 1.'} Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
       <div class="scroll"><table>${head}${body}</table></div>${feedNote}</div>`;
 
   const chIndex = new Map(meta.channels.map((c, i) => [c.id, i]));
@@ -322,6 +333,9 @@ function drawInsights(el) {
     onBucket: (k) => { state.prevRange ||= { from: state.dFrom, to: state.dTo, grain: state.grain }; const [a, b] = bucketSpan[g](k); if (g !== 'day') state.grain = 'day'; setRange(a < meta.months[0] + '-01' ? meta.months[0] + '-01' : a, b, true); },
     onSeries: (id) => openDrill([{ group: 'level1', id, name: ch[id]?.name }]),
   });
+  // The comparison view replaces the channel chart: the whole of the selected year, month by month.
+  if (state.chartMode === 'compare') compareChart($('#chart'));
+  $$('[data-cmode]', el).forEach((b) => (b.onclick = () => { state.chartMode = b.dataset.cmode; insights(el); }));
   let lgTimer;
   $$('[data-lg]', el).forEach((b) => {
     b.onclick = () => { clearTimeout(lgTimer); lgTimer = setTimeout(() => { const id = Number(b.dataset.lg); state.hiddenCh.has(id) ? state.hiddenCh.delete(id) : state.hiddenCh.add(id); drawInsights(el); }, 260); };
@@ -340,6 +354,7 @@ function drawInsights(el) {
   }
   $$('[data-grain]', el).forEach((b) => (b.onclick = () => { state.grain = b.dataset.grain; reload(); }));
   $$('[data-measure]', el).forEach((b) => (b.onclick = () => { state.measure = b.dataset.measure; drawInsights(el); }));
+  $$('[data-vs]', el).forEach((b) => (b.onclick = () => { state.vsMode = b.dataset.vs; drawInsights(el); }));
   $$('[data-zoom]', el).forEach((b) => (b.onclick = () => openZoom(b.dataset.zoom)));
   $$('tr[data-key]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); drawInsights(el); }));
 }
@@ -466,7 +481,7 @@ const PROJ = { spend: { name: 'Spend', money: true }, appts: { name: 'Appointmen
 const BASIS = { t3: 'Last 3 closed months', t12: 'Last 12 closed months', ly: 'Same month last year' };
 async function projections(el) {
   const k = state.pMeasure, P = PROJ[k], fmt = P.money ? money : int, big = P.money ? compact : int;
-  const [d, f] = await Promise.all([api(`/api/projections?${scope()}&year=${state.year}&basis=${state.pBasis}`), state.location ? null : api('/api/facts?' + scope())]);
+  const [d, f, log] = await Promise.all([api(`/api/projections?${scope()}&year=${state.year}&basis=${state.pBasis}`), state.location ? null : api('/api/facts?' + scope()), api('/api/projections/log?' + scope())]);
   // Figures are entered for one market location; wider views add the locations up and are read-only.
   const months = d.months, openMonths = months.filter((m) => !closed(m)), closedMonths = months.filter(closed), canEdit = !!d.brand && !!d.location;
   const locName = d.location ? meta.locations.find((l) => l.id === d.location)?.name : '';
@@ -530,12 +545,17 @@ async function projections(el) {
     <div class="card">
       <div class="row" style="justify-content:space-between"><div><h2>${P.name} by channel${d.brand ? ' and CRM campaign' : ''}${locName ? ` · ${esc(locName)}` : ''}</h2>
         <p class="sub" style="margin:0">Grey cells are actuals. ${canEdit ? 'White cells are projections: type a figure and press Enter. A bold cell has been changed by hand; clear it to go back to the default. Select a channel to open its campaigns.' : 'Months marked * are open.'}</p></div>
+        ${canEdit && openMonths.length ? '<button class="primary" id="p-move">Move between campaigns</button>' : ''}
         ${d.brand ? `<label>Share a channel across its campaigns by <select id="p-basis">${Object.entries(BASIS).map(([id, n]) => `<option value="${id}" ${id === state.pBasis ? 'selected' : ''}>${n}</option>`).join('')}</select></label>` : ''}</div>
       ${d.brand ? `<p class="sub" style="margin:6px 0 0">Campaigns without a hand-entered figure share what is left of their channel in proportion to their ${k === 'bookings' ? 'bookings' : 'appointments'} at that market location over the chosen period${k === 'spend' ? ' (spend follows appointments, on the assumption that campaigns bringing in appointments are the ones being paid for)' : ''}. A campaign with no activity in that period gets nothing until you enter a figure for it.</p>` : ''}
       <div class="scroll" style="margin-top:10px"><table><tr><th>Channel${d.brand ? ' / CRM campaign' : ''}</th>${th}<th>FY budget</th><th>FY outlook</th><th>Var</th></tr>${body}</table></div>
     </div>
+    <div class="card"><h2>Change log</h2><p class="sub">Every change to a projection for the brands and market location in view, newest first: who, when, what it was and what it became. The budget is never changed here.</p>
+      <div class="scroll" style="max-height:340px;overflow-y:auto"><table><tr><th>When</th><th class="l">Who</th><th class="l">Change</th><th class="l">Detail</th></tr>
+      ${log.map((a) => `<tr><td class="l">${new Date(a.at).toLocaleString()}</td><td class="l">${esc(a.user)}</td><td class="l">${esc({ 'projection: channel': 'Channel adjusted', 'projection: channel reset': 'Channel reset', 'projection: campaign': 'Campaign set by hand', 'projection: campaign reset': 'Campaign reset', 'projection: move': 'Moved between campaigns' }[a.action] || a.action)}</td><td class="l wrap">${esc(a.detail)}</td></tr>`).join('') || '<tr><td class="l muted" colspan="4">No changes yet.</td></tr>'}</table></div></div>
     ${gl}`;
 
+  if ($('#p-move')) $('#p-move').onclick = () => openMove(d);
   $$('[data-pm]', el).forEach((b) => (b.onclick = () => { state.pMeasure = b.dataset.pm; render(); }));
   if ($('#p-basis')) $('#p-basis').onchange = (e) => { state.pBasis = e.target.value; render(); };
   $$('tr[data-pch]', el).forEach((r) => (r.onclick = (e) => { if (e.target.tagName === 'INPUT') return; const id = Number(r.dataset.pch); state.pOpen.has(id) ? state.pOpen.delete(id) : state.pOpen.add(id); render(); }));
@@ -546,10 +566,155 @@ async function projections(el) {
       if (i.value === i.dataset.was) return;
       const amount = i.value === '' ? null : Number(i.value);
       if (i.dataset.ch) act(() => api('/api/projections/channel', { location_id: d.location, channel_id: Number(i.dataset.ch), month: i.dataset.m, measure: k, amount }), amount == null ? 'Back to the default' : 'Channel projection saved');
-      else act(() => api('/api/projections/campaign', { location_id: d.location, campaign_id: Number(i.dataset.camp), month: i.dataset.m, measure: k, amount }), amount == null ? 'Back to its automatic share' : 'Campaign set by hand');
+      else act(() => api('/api/projections/campaign', { basis: state.pBasis, location_id: d.location, campaign_id: Number(i.dataset.camp), month: i.dataset.m, measure: k, amount }), amount == null ? 'Back to its automatic share' : 'Campaign set by hand');
     };
   });
   if ($('#gl-month')) $('#gl-month').onchange = (e) => { state.glMonth = e.target.value; render(); };
+}
+
+// ---- move a projection between campaigns --------------------------------------
+// Opens over the Projections screen for the market location in view. The budget is never touched.
+async function openMove(d) {
+  const k = state.pMeasure, P = PROJ[k], fmt = P.money ? money : (v) => (Math.round(v * 10) / 10).toLocaleString('en-US');
+  const openMonths = d.months.filter((m) => !closed(m)), loc = meta.locations.find((l) => l.id === d.location);
+  const everyone = (await api('/api/campaigns?brand=' + d.brand)).filter((c) => ['crm', 'manual'].includes(c.source) && ['live', 'approved'].includes(c.status)).sort((a, b) => a.name.localeCompare(b.name));
+  let dlg = $('#drill');
+  if (!dlg) { dlg = document.createElement('dialog'); dlg.id = 'drill'; document.body.appendChild(dlg); dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); }); }
+  const s = { month: openMonths[0], from: '', to: '', amount: '', reason: '' };
+  const cur = (id, m) => d.campaigns.find((c) => String(c.id) === String(id))?.m[k].proj[d.months.indexOf(m)] || 0;
+  const draw = () => {
+    const sources = d.campaigns.filter((c) => cur(c.id, s.month) >= 0.5).sort((a, b) => cur(b.id, s.month) - cur(a.id, s.month));
+    if (!sources.some((c) => String(c.id) === String(s.from))) s.from = sources[0] ? String(sources[0].id) : '';
+    const avail = cur(s.from, s.month), amt = Number(s.amount) || 0, a = avail, b = s.to ? cur(s.to, s.month) : 0;
+    const fromName = sources.find((c) => String(c.id) === s.from)?.name || '—', toC = everyone.find((c) => String(c.id) === s.to);
+    const issues = [!s.from && 'There is nothing projected to move in that month.', !s.to && 'Choose a destination campaign.', s.to && s.to === s.from && 'Source and destination must be different campaigns.',
+      !(amt > 0) && 'Enter an amount to move.', amt > avail + 0.5 && `Only ${fmt(avail)} is available on the source campaign.`, s.reason.trim().length < 15 && 'Give a reason of at least 15 characters; it goes in the change log.'].filter(Boolean);
+    const channelOf = (c) => meta.level1.find((l) => l.id === c?.level1_id)?.channel_id, fromC = everyone.find((c) => String(c.id) === s.from);
+    const crossChannel = !!toC && !!fromC && channelOf(toC) !== channelOf(fromC);
+    dlg.innerHTML = `
+      <div class="row" style="justify-content:space-between;align-items:flex-start"><div><h2>Move projected ${P.name.toLowerCase().replace(' $', '')} <span class="hl">between campaigns</span></h2>
+        <p class="sub" style="margin:0">${esc(loc?.name || '')} · ${meta.brands.find((x) => x.id === d.brand)?.name || ''}</p></div><button id="mv-x" aria-label="Close">Close ✕</button></div>
+      <div class="move">
+        <div>
+          <label>Source campaign<select id="mv-from">${sources.map((c) => `<option value="${c.id}" ${String(c.id) === s.from ? 'selected' : ''}>${esc(c.name)} · ${fmt(cur(c.id, s.month))} avail.</option>`).join('') || '<option value="">Nothing projected this month</option>'}</select></label>
+          <p class="sub" style="margin:4px 0 10px">Available to move in ${mlabel(s.month)} ${s.month.slice(0, 4)}: ${fmt(avail)}, the campaign's current projection.</p>
+          <label>Destination campaign<select id="mv-to"><option value="">Select…</option>${everyone.filter((c) => String(c.id) !== s.from).map((c) => `<option value="${c.id}" ${String(c.id) === s.to ? 'selected' : ''}>${esc(c.name)} · ${esc(c.level1)}</option>`).join('')}</select></label>
+          <div class="row" style="margin-top:10px"><label style="flex:1">Amount<input id="mv-amt" type="number" min="0" step="${P.money ? 100 : 1}" value="${esc(s.amount)}"></label>
+            <label style="flex:1">Effective<select id="mv-month">${openMonths.map((m) => `<option value="${m}" ${m === s.month ? 'selected' : ''}>${mlabel(m)} ${m.slice(0, 4)}</option>`).join('')}</select></label></div>
+          <p style="margin:6px 0 10px">${[[0.25, '25%'], [0.5, '50%'], [1, 'Max']].map(([f, n]) => `<button class="link" data-part="${f}" style="margin-right:14px">${n}</button>`).join('')}</p>
+          <label>Reason for the move<textarea id="mv-why" rows="3" placeholder="e.g. Affiliates running at twice the target cost per appointment for three months; LSA has headroom below target.">${esc(s.reason)}</textarea></label>
+          <div class="issues">${issues.map((x) => `<div>✕ ${esc(x)}</div>`).join('')}</div>
+        </div>
+        <div>
+          <p class="ctl-l" style="margin:0 0 6px">Before and after · ${mlabel(s.month)} ${s.month.slice(0, 4)} projection</p>
+          <table><tr><th>Campaign</th><th>Current</th><th>Proposed</th><th>Change</th></tr>
+            <tr><td>${esc(fromName)}</td><td>${fmt(a)}</td><td>${fmt(Math.max(0, a - amt))}</td><td class="down">−${fmt(amt)}</td></tr>
+            <tr><td>${toC ? esc(toC.name) : 'Destination'}</td><td>${fmt(b)}</td><td>${fmt(b + amt)}</td><td class="up">+${fmt(amt)}</td></tr></table>
+          ${crossChannel ? '<p class="sub" style="margin:10px 0 0">These campaigns are in different channels, so the two channel projections move by the same amount.</p>' : ''}
+          <p class="sub" style="margin:10px 0 0">Both campaigns become hand-entered figures for this month, and every other campaign keeps the figure it has now.</p>
+        </div>
+      </div>
+      <div class="row" style="justify-content:space-between;margin-top:14px;border-top:1px solid var(--grid);padding-top:12px"><p class="sub" style="margin:0">A move changes the projection only. The budget stays as loaded, and actuals keep coming from the ledger and the ad platforms.</p>
+        <div class="row"><button id="mv-cancel">Cancel</button><button class="primary" id="mv-go" ${issues.length ? 'disabled' : ''}>Apply move</button></div></div>`;
+    const keep = (id, key) => { const el = $(id, dlg); el.oninput = () => { s[key] = el.value; const pos = el.selectionStart; draw(); const again = $(id, dlg); again.focus(); try { again.setSelectionRange(pos, pos); } catch { /* number inputs have no caret position */ } }; };
+    keep('#mv-amt', 'amount'); keep('#mv-why', 'reason');
+    $('#mv-from', dlg).onchange = (e) => { s.from = e.target.value; draw(); };
+    $('#mv-to', dlg).onchange = (e) => { s.to = e.target.value; draw(); };
+    $('#mv-month', dlg).onchange = (e) => { s.month = e.target.value; draw(); };
+    $$('[data-part]', dlg).forEach((btn) => (btn.onclick = () => { s.amount = String(P.money ? Math.floor(avail * Number(btn.dataset.part)) : Math.floor(avail * Number(btn.dataset.part) * 10) / 10); draw(); }));
+    $('#mv-x', dlg).onclick = $('#mv-cancel', dlg).onclick = () => dlg.close();
+    $('#mv-go', dlg).onclick = async () => {
+      try { await api('/api/projections/move', { location_id: d.location, from: Number(s.from), to: Number(s.to), month: s.month, measure: k, amount: amt, reason: s.reason, basis: state.pBasis }); dlg.close(); toast('Projection moved'); render(); }
+      catch (e) { toast(e.message, true); }
+    };
+  };
+  draw();
+  if (!dlg.open) dlg.showModal();
+}
+
+// ---- actual vs budget vs projection chart ----------------------------------------
+// The same stage as the channel chart, as three bars a month: what happened, the fixed budget, and the current projection.
+function compareChart(host) {
+  host._ro?.disconnect();
+  const k = state.measure, P = ins.plan;
+  if (!P || !PROJ[k]) { host.innerHTML = '<p class="sub" style="padding:28px 0;margin:0">Budget and projections exist for Spend, Appointments and Bookings $. Pick one of those stages to compare.</p>'; return; }
+  const fmt = PROJ[k].money ? compact : int, months = P.months, chans = P.channels.filter((c) => !state.hiddenCh.has(c.id)), lastData = meta.dataThrough.slice(0, 7);
+  const tot = (f) => months.map((_, i) => chans.reduce((a, c) => a + c.m[k][f][i], 0));
+  const groups = [{ name: 'Actual', color: '#1e3a5f', values: tot('actual').map((v, i) => (months[i] <= lastData ? v : null)) }, { name: 'Budget', color: '#a8b4c4', values: tot('budget') }, { name: 'Projection', color: 'var(--accent)', values: tot('plan') }];
+  const draw = () => {
+    const W = Math.max(300, Math.round(host.clientWidth || 960)), H = Math.round(Math.min(440, Math.max(230, W * 0.34))), L = W < 520 ? 46 : 62, R = 14, T = 16, B = 32, pw = W - L - R, ph = H - T - B;
+    const max = Math.max(1e-9, ...groups.flatMap((g) => g.values.map((v) => v || 0)));
+    const step = (() => { const raw = max / 5, p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 2.5, 5, 10].map((x) => x * p).find((x) => x >= raw); })();
+    const top = Math.ceil((max * 1.04) / step) * step, y = (v) => T + ph - (v / top) * ph, bw = pw / months.length, w = Math.max(2, Math.min(34, (bw * 0.8) / 3 - 2));
+    let svg = `<rect x="${L}" y="${T}" width="${pw}" height="${ph}" fill="none" stroke="var(--grid)"/>`;
+    for (let v = 0; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${v ? 'var(--grid)' : 'var(--axis)'}"/><text class="ax" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`;
+    months.forEach((m, i) => {
+      const x0 = L + bw * i + (bw - (w + 2) * 3 + 2) / 2;
+      if (i) svg += `<line x1="${L + bw * i}" x2="${L + bw * i}" y1="${T}" y2="${T + ph}" stroke="var(--grid)"/>`;
+      groups.forEach((g, gi) => { const v = g.values[i]; if (v == null || v <= 0) return; const h = y(0) - y(v), r = Math.min(3, h, w / 2), x = x0 + gi * (w + 2), yt = y(v); svg += `<path d="M${x},${yt + h}V${yt + r}Q${x},${yt} ${x + r},${yt}H${x + w - r}Q${x + w},${yt} ${x + w},${yt + r}V${yt + h}Z" fill="${g.color}"/>`; });
+      svg += `<text class="ax" x="${L + bw * i + bw / 2}" y="${H - 10}" text-anchor="middle">${bucketLabel.month(m, bw)}${closed(m) ? '' : '*'}</text><rect data-i="${i}" x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="transparent"/>`;
+    });
+    host.innerHTML = `<div class="legend" style="margin-top:0">${groups.map((g) => `<span class="lg-py"><i style="display:inline-block;width:10px;height:10px;border:0;border-radius:2px;background:${g.color};vertical-align:-1px;margin-right:5px"></i>${g.name}</span>`).join('')}</div>
+      <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Actual, budget and projection by month">${svg}</svg><div class="tip"></div>`;
+    const tip = $('.tip', host), vs = (a, b) => (a == null || !b ? '—' : `${a - b >= 0 ? '+' : '−'}${fmt(Math.abs(a - b))} (${a - b >= 0 ? '+' : '−'}${(Math.abs(a / b - 1) * 100).toFixed(1)}%)`);
+    host.onclick = host.ondblclick = null;
+    host.onmousemove = (e) => {
+      const i = e.target.dataset?.i; if (i == null) return (tip.style.display = 'none');
+      const [a, b, p] = groups.map((g) => g.values[i]);
+      tip.innerHTML = `<b>${bucketTitle.month(months[i])}${closed(months[i]) ? '' : months[i] <= lastData ? ' · month to date' : ' · not started'}</b>` + groups.map((g) => `<div><span><i class="dot" style="background:${g.color}"></i>${g.name}</span><span>${g.values[i] == null ? '—' : fmt(g.values[i])}</span></div>`).join('') +
+        `<div style="margin-top:4px"><span>Actual vs budget</span><span>${vs(a, b)}</span></div><div><span>Actual vs projection</span><span>${vs(a, p)}</span></div>`;
+      const box = host.getBoundingClientRect(); tip.style.display = 'block';
+      tip.style.left = Math.max(0, Math.min(e.clientX - box.left + 14, box.width - tip.offsetWidth - 4)) + 'px'; tip.style.top = Math.max(0, e.clientY - box.top - 20) + 'px';
+    };
+    host.onmouseleave = () => (tip.style.display = 'none');
+    host._w = W;
+  };
+  draw();
+  host._ro = new ResizeObserver(() => { if (host.isConnected && host.clientWidth > 0 && Math.abs(host.clientWidth - host._w) > 6) draw(); });
+  host._ro.observe(host);
+}
+
+// ---- ledger lines: assign or split one at a time ------------------------------
+let ledgerGroups = [], ledgerCampaigns = [];
+async function openLedgerLines(g) {
+  let dlg = $('#drill');
+  if (!dlg) { dlg = document.createElement('dialog'); dlg.id = 'drill'; document.body.appendChild(dlg); dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); }); }
+  const l1 = meta.level1.find((l) => l.id === g.level1_id)?.name || '';
+  const campOptions = (sel) => `<option value="">Choose a campaign…</option>${meta.level1.filter((l) => ledgerCampaigns.some((c) => c.level1_id === l.id)).map((l) => `<optgroup label="${esc(l.name)}">${opts(ledgerCampaigns.filter((c) => c.level1_id === l.id), sel)}</optgroup>`).join('')}`;
+  let editing = null, draft = []; // the line being assigned, and its parts
+  const load = () => api(`/api/ledger/lines?${scope()}&year=${state.year}&level1=${g.level1_id}&vendor=${encodeURIComponent(g.vendor_key)}`);
+  let lines = await load();
+  const draw = () => {
+    const left = (ln) => ln.amount - draft.reduce((a, p) => a + (Number(p.amount) || 0), 0);
+    dlg.innerHTML = `
+      <div class="row" style="justify-content:space-between;align-items:flex-start"><div><h2>${esc(g.vendor || 'Lines with no vendor')} <span class="hl">· ${esc(l1)}</span></h2>
+        <p class="sub" style="margin:0">${lines.length} ledger lines in ${state.year}. Assign a line to one CRM campaign, or split it across several. Anything you leave unassigned stays in "Other GL spend".</p></div><button id="ll-x">Close ✕</button></div>
+      <div class="scroll" style="max-height:66vh;overflow-y:auto;margin-top:10px"><table>
+        <tr><th>Date</th><th class="l">Description</th><th class="l">Reference</th><th class="l">Market location</th><th>Amount</th><th class="l">Assigned to</th><th class="l"></th></tr>
+        ${lines.map((ln, i) => `<tr><td class="l">${esc(ln.day || ln.month)}</td><td class="l wrap">${esc(ln.description || '—')}</td><td class="l">${esc(ln.ref || '—')}</td><td class="l">${esc(ln.location)}</td><td>${money(ln.amount)}</td>
+            <td class="l wrap">${ln.covered ? '<span class="muted">Covered by ad platform</span>' : ln.parts.length ? ln.parts.map((p) => `${esc(p.name)} ${money(p.amount)}${p.rule ? ' <span class="muted">(rule)</span>' : ''}`).join('<br>') : '<span class="chip rejected">Needs a campaign</span>'}</td>
+            <td class="l">${ln.covered ? '' : `<button data-ll-edit="${i}">${ln.parts.length ? 'Change' : 'Assign / split'}</button>`}</td></tr>
+          ${editing === i ? `<tr class="src"><td colspan="7" style="padding:10px 12px"><div class="split">
+            ${draft.map((p, j) => `<div class="row"><select data-ll-camp="${j}" style="flex:2;max-width:420px">${campOptions(p.campaign_id)}</select><input type="number" step="0.01" data-ll-amt="${j}" value="${esc(p.amount)}" style="width:130px" aria-label="Amount">${draft.length > 1 ? `<button class="link" data-ll-del="${j}">Remove</button>` : ''}</div>`).join('')}
+            <div class="row" style="justify-content:space-between"><div class="row"><button class="link" id="ll-add">+ Split to another campaign</button>
+              <span class="muted">${Math.abs(left(ln)) < 0.005 ? 'The whole line is assigned.' : left(ln) * Math.sign(ln.amount || 1) > 0 ? `${money(left(ln))} of this line stays unassigned.` : `<span class="down">Over by ${money(-left(ln))}.</span>`}</span></div>
+              <div class="row">${ln.parts.length ? '<button id="ll-clear">Clear assignment</button>' : ''}<button id="ll-cancel">Cancel</button><button class="primary" id="ll-save" ${draft.some((p) => p.campaign_id && Number(p.amount)) && left(ln) * Math.sign(ln.amount || 1) > -0.005 ? '' : 'disabled'}>Save</button></div></div>
+          </div></td></tr>` : ''}`).join('') || '<tr><td class="l muted" colspan="7">No lines.</td></tr>'}</table></div>`;
+    $('#ll-x', dlg).onclick = () => dlg.close();
+    $$('[data-ll-edit]', dlg).forEach((b) => (b.onclick = () => { editing = Number(b.dataset.llEdit); const ln = lines[editing]; draft = ln.parts.filter((p) => !p.rule || true).map((p) => ({ campaign_id: p.campaign_id, amount: String(Math.round(p.amount * 100) / 100) })); if (!draft.length) draft = [{ campaign_id: '', amount: String(Math.round(ln.amount * 100) / 100) }]; draw(); }));
+    if (editing == null) return;
+    const ln = lines[editing];
+    $$('[data-ll-camp]', dlg).forEach((s) => (s.onchange = () => { draft[Number(s.dataset.llCamp)].campaign_id = s.value; draw(); }));
+    $$('[data-ll-amt]', dlg).forEach((inp) => (inp.onchange = () => { draft[Number(inp.dataset.llAmt)].amount = inp.value; draw(); }));
+    $$('[data-ll-del]', dlg).forEach((b) => (b.onclick = () => { draft.splice(Number(b.dataset.llDel), 1); draw(); }));
+    $('#ll-add', dlg).onclick = () => { draft.push({ campaign_id: '', amount: String(Math.round(Math.max(0, left(ln) * Math.sign(ln.amount || 1)) * Math.sign(ln.amount || 1) * 100) / 100) }); draw(); };
+    $('#ll-cancel', dlg).onclick = () => { editing = null; draw(); };
+    const send = async (parts, msg) => { try { await api('/api/ledger/assign', { ext: ln.ext, parts }); toast(msg); editing = null; lines = await load(); draw(); render(); } catch (e) { toast(e.message, true); } };
+    $('#ll-save', dlg).onclick = () => send(draft.filter((p) => p.campaign_id && Number(p.amount)).map((p) => ({ campaign_id: Number(p.campaign_id), amount: Number(p.amount) })), draft.length > 1 ? 'Line split' : 'Line assigned');
+    if ($('#ll-clear', dlg)) $('#ll-clear', dlg).onclick = () => send([], 'Assignment cleared');
+  };
+  draw();
+  if (!dlg.open) dlg.showModal();
 }
 
 // ---- Campaigns -------------------------------------------------------------
@@ -604,7 +769,7 @@ async function campaigns(el) {
 
 // ---- Mappings --------------------------------------------------------------
 async function mappings(el) {
-  const tabs = { names: 'CRM campaign names', links: 'Spend links', hierarchy: 'Channel and Level 1', brands: 'Brands and regions', changes: 'Changes' };
+  const tabs = { names: 'CRM campaign names', links: 'Spend links', ledger: 'Ledger spend', hierarchy: 'Channel and Level 1', brands: 'Brands and regions', changes: 'Changes' };
   let html = `<h1>Maestro <span class="hl">Mappings</span></h1><p class="sub">Tie each CRM campaign name to one campaign, each campaign to a Level 1, and each Level 1 to a Channel.</p>
     <div class="tabs">${Object.entries(tabs).map(([k, n]) => `<button data-tab="${k}" class="${k === state.mapTab ? 'on' : ''}">${n}</button>`).join('')}</div>`;
   if (state.mapTab === 'names') {
@@ -650,6 +815,33 @@ async function mappings(el) {
       <div class="card"><h2>Linked</h2><div class="scroll"><table><tr><th>Ad-platform campaign</th><th class="l">Brand</th><th class="l">Platform</th><th>Spend</th><th class="l">CRM campaign</th><th class="l"></th></tr>
       ${done.slice(0, 300).map((r) => `<tr><td class="wrap">${esc(r.name)}</td><td class="l">${esc(r.brand)}</td><td class="l">${PLATFORM_NAME[r.source]}</td><td>${money(r.spend)}</td>
         <td class="l">${r.status === 'linked' ? esc(r.linked_name) : 'Same name in the CRM'}</td><td class="l">${r.status === 'linked' ? `<button class="link" data-unlink="${r.id}">Unlink</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="6" class="l muted">Nothing linked yet.</td></tr>'}</table></div></div>`;
+  } else if (state.mapTab === 'ledger') {
+    if (!state.brand) html += '<div class="banner" style="background:var(--wash);border-color:#cfe0f5">Pick one brand above to see its ledger spend and assign it to CRM campaigns.</div>';
+    else {
+      const d = await api(`/api/ledger?${scope()}&year=${state.year}`), T = d.totals, f = state.ledger;
+      const status = (g) => (g.rule ? 'rule' : g.covered >= g.amount - 0.5 && g.amount > 0 ? 'covered' : g.open > 0.5 ? (g.assigned > 0.5 ? 'part' : 'open') : 'done');
+      const label = { rule: ['live', 'Vendor rule'], covered: ['', 'Covered by ad platform'], part: ['pending', 'Partly assigned'], open: ['rejected', 'Needs a campaign'], done: ['live', 'Assigned'] };
+      const shown = d.groups.filter((g) => (f.show === 'all' || (f.show === 'open' ? ['open', 'part'].includes(status(g)) : f.show === 'assigned' ? ['rule', 'done', 'part'].includes(status(g)) : status(g) === 'covered')) && (!f.q || (g.vendor || '(no vendor)').toLowerCase().includes(f.q.toLowerCase())));
+      const l1n = Object.fromEntries(meta.level1.map((l) => [l.id, l.name]));
+      const pickCamp = (sel, attrs) => `<select ${attrs}><option value="">Choose a campaign…</option>${meta.level1.filter((l) => d.campaigns.some((c) => c.level1_id === l.id)).map((l) => `<optgroup label="${esc(l.name)}">${opts(d.campaigns.filter((c) => c.level1_id === l.id), sel)}</optgroup>`).join('')}</select>`;
+      ledgerCampaigns = d.campaigns;
+      html += `<div class="tiles">
+        <div class="tile"><div class="k">Ledger spend · ${d.year}</div><div class="v">${compact(T.amount)}</div><div class="d">${d.groups.reduce((a, g) => a + g.lines, 0).toLocaleString()} lines</div></div>
+        <div class="tile"><div class="k">On a CRM campaign</div><div class="v">${compact(T.assigned)}</div><div class="d">${T.amount ? pct(T.assigned / T.amount) : '—'} of the ledger, by rule or by hand</div></div>
+        <div class="tile"><div class="k">Covered by ad platform</div><div class="v">${compact(T.covered)}</div><div class="d">Campaign detail comes from the feed</div></div>
+        <div class="tile"><div class="k">Needs a campaign</div><div class="v">${compact(T.open)}</div><div class="d">${T.amount ? pct(T.open / T.amount) : '—'} of the ledger, shown as "Other GL spend"</div></div></div>
+      <div class="card"><div class="row" style="justify-content:space-between"><div><h2>Ledger spend by vendor</h2><p class="sub" style="margin:0">Nothing is assigned automatically. Choose the CRM campaign a vendor's spend is for and select "Assign all" to make it a rule for that vendor, or open the lines to assign or split them one at a time.</p></div>
+        <div class="row"><label>Show <select id="lg-show">${[['open', 'Needs a campaign'], ['assigned', 'Assigned'], ['covered', 'Covered by ad platform'], ['all', 'Everything']].map(([v, n]) => `<option value="${v}" ${v === f.show ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+        <label>Vendor contains <input type="text" id="lg-q" value="${esc(f.q)}" placeholder="e.g. iHeart"></label></div></div>
+        <div class="scroll" style="margin-top:10px"><table><tr><th>Vendor</th><th class="l">Level 1</th><th>Lines</th><th>Ledger spend</th><th>Still to assign</th><th class="l">Status</th><th class="l">CRM campaign</th><th class="l">Why suggested</th><th class="l"></th></tr>
+        ${shown.slice(0, 200).map((g) => { const st = status(g), i = d.groups.indexOf(g); return `<tr><td class="wrap">${esc(g.vendor || '(no vendor on the line)')}</td><td class="l">${esc(l1n[g.level1_id] || '')}</td><td>${g.lines}</td><td>${money(g.amount)}</td><td>${st === 'covered' ? '—' : money(Math.max(0, g.open))}</td>
+          <td class="l"><span class="chip ${label[st][0]}">${label[st][1]}</span></td>
+          <td class="l">${st === 'covered' ? '<span class="muted">—</span>' : g.vendor_key ? pickCamp(g.rule?.campaign_id ?? g.suggest?.id, `data-lg-pick="${i}"`) : '<span class="muted">Assign line by line</span>'}</td>
+          <td class="l wrap muted">${g.rule ? 'Rule in place' : g.suggest ? esc(g.suggest.why[0].toUpperCase() + g.suggest.why.slice(1)) : st === 'covered' ? '' : 'No clear campaign'}</td>
+          <td class="l" style="white-space:nowrap">${st !== 'covered' && g.vendor_key ? `<button class="primary" data-lg-rule="${i}">${g.rule ? 'Change' : 'Assign all'}</button> ` : ''}${g.rule ? `<button data-lg-unrule="${i}">Remove rule</button> ` : ''}<button data-lg-lines="${i}">Lines ›</button></td></tr>`; }).join('') || '<tr><td class="l muted" colspan="9">Nothing here for this selection.</td></tr>'}</table></div>
+        ${shown.length > 200 ? `<p class="sub" style="margin:8px 0 0">Showing the 200 largest of ${shown.length}. Use the vendor search to narrow it.</p>` : ''}</div>`;
+      ledgerGroups = d.groups;
+    }
   } else if (state.mapTab === 'brands') {
     const list = [...meta.brands].sort((x, y) => x.region.localeCompare(y.region) || x.name.localeCompare(y.name));
     html += `<div class="card"><h2>Brands and regions</h2><p class="sub">Each brand sits in one region, and the region sets its division (Canada, or US for every other region). These drive the Division and Region filters at the top of every screen.</p><div class="scroll"><table>
@@ -670,6 +862,11 @@ async function mappings(el) {
   el.innerHTML = html;
   $$('[data-tab]', el).forEach((b) => (b.onclick = () => { state.mapTab = b.dataset.tab; render(); }));
   $$('[data-map]', el).forEach((b) => (b.onclick = () => { const v = $(`[data-pick="${b.dataset.map}"]`).value; if (!v) return toast('Choose a campaign first', true); act(() => api('/api/mappings', { id: Number(b.dataset.map), campaign_id: Number(v) }), 'Name mapped'); }));
+  if ($('#lg-show')) { $('#lg-show').onchange = (e) => { state.ledger.show = e.target.value; render(); }; $('#lg-q').onchange = (e) => { state.ledger.q = e.target.value; render(); }; }
+  const ruleFor = (i, campaign_id) => ({ brand_id: Number(state.brand), level1_id: ledgerGroups[i].level1_id, vendor: ledgerGroups[i].vendor, campaign_id });
+  $$('[data-lg-rule]', el).forEach((b) => (b.onclick = () => { const i = Number(b.dataset.lgRule), v = $(`[data-lg-pick="${i}"]`).value; if (!v) return toast('Choose a campaign first', true); act(() => api('/api/ledger/rule', ruleFor(i, Number(v))), 'Vendor rule saved: its lines now sit on that campaign'); }));
+  $$('[data-lg-unrule]', el).forEach((b) => (b.onclick = () => act(() => api('/api/ledger/rule', ruleFor(Number(b.dataset.lgUnrule), null)), 'Rule removed')));
+  $$('[data-lg-lines]', el).forEach((b) => (b.onclick = () => openLedgerLines(ledgerGroups[Number(b.dataset.lgLines)])));
   $$('[data-assign]', el).forEach((b) => (b.onclick = () => { const v = $(`[data-un="${b.dataset.assign}"]`).value; if (!v) return toast('Choose a Level 1 first', true); act(() => api('/api/campaigns/level1', { id: Number(b.dataset.assign), level1_id: Number(v) }), 'Level 1 assigned'); }));
   $$('[data-link]', el).forEach((b) => (b.onclick = () => { const v = $(`[data-link-pick="${b.dataset.link}"]`).value; if (!v) return toast('Choose a CRM campaign first', true); act(() => api('/api/links', { id: Number(b.dataset.link), crm_id: Number(v) }), 'Spend linked'); }));
   $$('[data-unlink]', el).forEach((b) => (b.onclick = () => act(() => api('/api/links', { id: Number(b.dataset.unlink), crm_id: null }), 'Spend unlinked')));

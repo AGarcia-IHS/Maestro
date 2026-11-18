@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, MONTHS, YEARS, CLOSED_THROUGH, FX_CAD_USD, REGIONS, divisionOf, getMode, getThrough } from './db.js';
-import { listFolder, runImport } from './lib/importers.js';
+import { listFolder, runImport, coveredGroups, applyRules, rebuildUnallocated } from './lib/importers.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
 const PORT = Number(process.env.PORT) || 4173;
@@ -135,6 +135,10 @@ function collect(query, grain, spendKey, crmKey, where) {
 // Figures are entered for one market location; a brand, region or division view adds its locations up.
 // Money on the planning side (budget, projections, overrides) is held in USD.
 const PROJ_MEASURES = ['spend', 'appts', 'bookings'], PROJ_NAME = { spend: 'Spend', appts: 'Appointments', bookings: 'Bookings $' };
+const projFmt = (k, v) => (k === 'appts' ? (Math.round(v * 10) / 10).toLocaleString('en-US') : sym() + Math.round(v).toLocaleString('en-US'));
+const projStore = (k, v) => (k === 'appts' ? v : v / usdFx()); // planning money is held in USD
+// The projection as it stands for one market location, used to record what a figure was before a change.
+function projNow(lo, month, basis) { SCOPE = [lo.brand_id]; return projections({ year: month.slice(0, 4), location: lo.id, basis }); }
 function projections(query) {
   const year = /^\d{4}$/.test(query.year || '') ? query.year : CLOSED_THROUGH.slice(0, 4);
   const months = MONTHS.filter((m) => m.startsWith(year)), at = new Map(months.map((m, i) => [m, i]));
@@ -154,24 +158,30 @@ function projections(query) {
   const in3 = `IN (${last3.map((m) => `'${m}'`).join(',')})`;
   for (const r of q(spendSql(`s.month ${in3}`)).all()) cell(r.lo, r.ch).spend.base += r.v / last3.length;
   for (const r of q(crmSql(`f.month ${in3}`)).all()) { const x = cell(r.lo, r.ch); x.appts.base += r.appts / last3.length; x.bookings.base += r.bookings / last3.length; }
-  const hasBudget = { spend: false, appts: false, bookings: false };
+  const hasBudget = { spend: false, appts: false, bookings: false }, budgeted = new Set(); // budgeted: brand | measure | month index, where the brand has a budget anywhere
+  const brandOf = new Map(q('SELECT id, brand_id FROM location').all().map((r) => [r.id, r.brand_id]));
   for (const r of q(`SELECT t.location_id lo, l.channel_id ch, t.month m, t.measure k, SUM(t.amount) v FROM budget_l1 t JOIN level1 l ON l.id = t.level1_id WHERE t.month LIKE ? AND ${inScope('t.brand_id')} ${at1('t.location_id')} GROUP BY 1, 2, 3, 4`).all(year + '%')) {
-    cell(r.lo, r.ch)[r.k].budget[at.get(r.m)] += r.v * money(r.k); hasBudget[r.k] = true;
+    cell(r.lo, r.ch)[r.k].budget[at.get(r.m)] += r.v * money(r.k); hasBudget[r.k] = true; budgeted.add(`${brandOf.get(r.lo)}|${r.k}|${at.get(r.m)}`);
   }
   for (const r of q(`SELECT p.location_id lo, p.channel_id ch, p.month m, SUM(p.budget * ${fxSql('b')}) v FROM channel_plan p JOIN brand b ON b.id = p.brand_id WHERE p.month LIKE ? AND p.budget <> 0 AND ${inScope('p.brand_id')} ${at1('p.location_id')} GROUP BY 1, 2, 3`).all(year + '%')) {
-    cell(r.lo, r.ch).spend.budget[at.get(r.m)] += r.v; hasBudget.spend = true;
+    cell(r.lo, r.ch).spend.budget[at.get(r.m)] += r.v; hasBudget.spend = true; budgeted.add(`${brandOf.get(r.lo)}|spend|${at.get(r.m)}`);
   }
   for (const r of q(`SELECT location_id lo, channel_id ch, month m, measure k, amount v FROM proj_channel WHERE month LIKE ? AND ${inScope('brand_id')} ${at1('location_id')}`).all(year + '%')) cell(r.lo, r.ch)[r.k].over[at.get(r.m)] = r.v * money(r.k);
-  // channel projection for one location: actual when closed, else the override, else budget, else run rate
-  const projOf = (x, k, i) => (months[i] <= CLOSED_THROUGH ? x[k].actual[i] : x[k].over[i] ?? (x[k].budget[i] > 0 ? x[k].budget[i] : x[k].base));
-  const channels = q('SELECT id, name FROM channel ORDER BY sort').all().map((c) => ({ id: c.id, name: c.name, m: Object.fromEntries(PROJ_MEASURES.map((k) => [k, { budget: z(), actual: z(), proj: z(), set: months.map(() => false), fromRunRate: months.map(() => false) }])) }));
+  // Where a channel starts when nothing has been entered: its budget. With no budget it starts at zero if the brand is
+  // budgeted anywhere that month (the budget is the plan, wherever it was entered), and at its run rate only when the
+  // brand has no budget at all.
+  const start = (lo, x, k, i) => (x[k].budget[i] > 0 ? x[k].budget[i] : budgeted.has(`${brandOf.get(Number(lo))}|${k}|${i}`) ? 0 : x[k].base);
+  // channel projection for one location: actual when closed, else the hand-entered figure, else where it starts
+  const projOf = (lo, x, k, i) => (months[i] <= CLOSED_THROUGH ? x[k].actual[i] : x[k].over[i] ?? start(lo, x, k, i));
+  const channels = q('SELECT id, name FROM channel ORDER BY sort').all().map((c) => ({ id: c.id, name: c.name, m: Object.fromEntries(PROJ_MEASURES.map((k) => [k, { budget: z(), actual: z(), proj: z(), plan: z(), set: months.map(() => false), fromRunRate: months.map(() => false) }])) }));
   const chById = new Map(channels.map((c) => [c.id, c]));
   for (const [key, x] of cells) {
-    const c = chById.get(Number(key.split('|')[1])); if (!c) continue;
+    const [lo, chId] = key.split('|'), c = chById.get(Number(chId)); if (!c) continue;
     for (const k of PROJ_MEASURES) months.forEach((mo, i) => {
-      c.m[k].budget[i] += x[k].budget[i]; c.m[k].actual[i] += x[k].actual[i]; c.m[k].proj[i] += projOf(x, k, i);
+      c.m[k].budget[i] += x[k].budget[i]; c.m[k].actual[i] += x[k].actual[i]; c.m[k].proj[i] += projOf(lo, x, k, i);
+      c.m[k].plan[i] += x[k].over[i] ?? (mo > CLOSED_THROUGH ? start(lo, x, k, i) : x[k].budget[i]);
       if (x[k].over[i] != null) c.m[k].set[i] = true;
-      if (mo > CLOSED_THROUGH && x[k].over[i] == null && !(x[k].budget[i] > 0) && x[k].base > 0) c.m[k].fromRunRate[i] = true;
+      if (mo > CLOSED_THROUGH && x[k].over[i] == null && !(x[k].budget[i] > 0) && !budgeted.has(`${brandOf.get(Number(lo))}|${k}|${i}`) && x[k].base > 0) c.m[k].fromRunRate[i] = true;
     });
   }
   const out = { year, months, basis, hasBudget, brand: SCOPE?.length === 1 ? SCOPE[0] : null, location: loc, channels: channels.filter((c) => PROJ_MEASURES.some((k) => c.m[k].budget.some(Boolean) || c.m[k].actual.some(Boolean) || c.m[k].proj.some(Boolean))), campaigns: [], unassigned: {} };
@@ -206,7 +216,7 @@ function projections(query) {
       const x = cells.get(`${lo}|${ch.id}`);
       for (const k of PROJ_MEASURES) months.forEach((mo, i) => {
         if (mo <= CLOSED_THROUGH) { let on = 0; for (const c of inCh) { const v = actual.get(`${c.id}|${lo}|${k}`)?.[i] || 0; c.m[k].actual[i] += v; c.m[k].proj[i] += v; on += v; } un[k][i] += (x ? x[k].actual[i] : 0) - on; return; }
-        const target = x ? projOf(x, k, i) : 0;
+        const target = x ? projOf(lo, x, k, i) : 0;
         let fixed = 0, shared = 0; const free = [];
         for (const c of inCh) { const v = manual.get(`${c.id}|${lo}|${k}|${mo}`); if (v != null) { c.m[k].proj[i] += v; c.m[k].manual[i] = true; fixed += v; } else free.push([c, weight(c.id, lo, k, i)]); }
         const rest = Math.max(0, target - fixed), W = free.reduce((a, [, w]) => a + w, 0);
@@ -217,6 +227,18 @@ function projections(query) {
   }
   out.campaigns = camps.filter((c) => PROJ_MEASURES.some((k) => c.m[k].actual.some((v) => Math.abs(v) > 0.005) || c.m[k].proj.some((v) => Math.abs(v) > 0.005) || c.m[k].manual.some(Boolean)));
   return out;
+}
+
+// The spend projection by channel for a date range: each month's planned figure (the hand-entered projection, else the
+// budget) taken in proportion to the days of that month that fall inside the range.
+function spendPlan(query) {
+  const share = new Map(q('SELECT month, COUNT(*) * 1.0 / MAX(mdays) f FROM cal WHERE day BETWEEN ? AND ? GROUP BY month').all(query.from, query.to).map((r) => [r.month, r.f]));
+  const out = new Map();
+  for (const year of new Set([...share.keys()].map((m) => m.slice(0, 4)))) {
+    const p = projections({ year, location: query.location });
+    for (const c of p.channels) p.months.forEach((m, i) => { if (share.has(m)) out.set(c.id, (out.get(c.id) || 0) + c.m.spend.plan[i] * share.get(m)); });
+  }
+  return [...out].map(([channel_id, plan]) => ({ channel_id, plan }));
 }
 
 // ---- API -------------------------------------------------------------------
@@ -255,44 +277,84 @@ const routes = {
   // ---- projections -----------------------------------------------------------
   'GET /api/projections': ({ query }) => projections(query),
 
-  // A channel projection for one open month. An empty amount goes back to the default (budget, or run rate where no budget is loaded).
+  // Every change to a projection, newest first, for the brands and market location in view.
+  'GET /api/projections/log': ({ query }) => {
+    const brands = SCOPE ? q(`SELECT name FROM brand WHERE id IN (${SCOPE.join(',') || 0})`).all().map((b) => b.name) : null;
+    const loc = num(query.location) ? q('SELECT name FROM location WHERE id = ?').get(num(query.location))?.name : null;
+    return q("SELECT at, user, action, detail FROM audit WHERE action LIKE 'projection:%' ORDER BY id DESC LIMIT 2000").all()
+      .filter((a) => (!brands || brands.some((b) => a.detail.startsWith(b + ' · '))) && (!loc || a.detail.includes(` · ${loc} · `))).slice(0, 300);
+  },
+
+  // A channel projection for one market location and open month. An empty amount goes back to the default (budget, or run rate where no budget is loaded).
   'POST /api/projections/channel': ({ body, user }) => tx(() => {
-    const lo = q('SELECT l.*, b.name brand FROM location l JOIN brand b ON b.id = l.brand_id WHERE l.id = ?').get(num(body.location_id)), ch = q('SELECT * FROM channel WHERE id = ?').get(num(body.channel_id));
+    const lo = q('SELECT l.*, b.name brand FROM location l JOIN brand b ON b.id = l.brand_id WHERE l.id = ?').get(num(body.location_id)), ch = q('SELECT * FROM channel WHERE id = ?').get(num(body.channel_id)), k = body.measure;
     need(lo && ch, 'Pick a market location to enter projections');
-    const brand = { id: lo.brand_id, name: `${lo.brand} · ${lo.name}` };
-    need(PROJ_MEASURES.includes(body.measure), 'Unknown measure');
+    need(PROJ_MEASURES.includes(k), 'Unknown measure');
     need(OPEN_MONTHS.includes(body.month), 'Only open months can be projected');
+    const now = projNow(lo, body.month), i = now.months.indexOf(body.month), was = now.channels.find((c) => c.id === ch.id)?.m[k].proj[i] || 0;
+    const where = `${lo.brand} · ${lo.name} · ${ch.name} · ${PROJ_NAME[k]} · ${body.month}`;
     if (body.amount === null || body.amount === '') {
-      q('DELETE FROM proj_channel WHERE month = ? AND location_id = ? AND channel_id = ? AND measure = ?').run(body.month, lo.id, ch.id, body.measure);
-      audit(user, 'channel projection reset', `${brand.name} · ${ch.name} · ${PROJ_NAME[body.measure]} · ${body.month}`);
+      q('DELETE FROM proj_channel WHERE month = ? AND location_id = ? AND channel_id = ? AND measure = ?').run(body.month, lo.id, ch.id, k);
+      audit(user, 'projection: channel reset', `${where}: ${projFmt(k, was)} → back to the default`);
       return { ok: true };
     }
     const amount = Number(body.amount);
     need(Number.isFinite(amount) && amount >= 0, 'Amount must be zero or more');
     q('INSERT INTO proj_channel (month, brand_id, location_id, channel_id, measure, amount) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (month, location_id, channel_id, measure) DO UPDATE SET amount = excluded.amount')
-      .run(body.month, brand.id, lo.id, ch.id, body.measure, body.measure === 'appts' ? amount : amount / usdFx());
-    audit(user, 'channel projection', `${brand.name} · ${ch.name} · ${PROJ_NAME[body.measure]} · ${body.month}: ${body.measure === 'appts' ? '' : sym()}${Math.round(amount).toLocaleString()}`);
+      .run(body.month, lo.brand_id, lo.id, ch.id, k, projStore(k, amount));
+    audit(user, 'projection: channel', `${where}: ${projFmt(k, was)} → ${projFmt(k, amount)}`);
     return { ok: true };
   }),
 
-  // A manual override for one CRM campaign. The rest of its channel is re-shared automatically around it. An empty amount removes the override.
+  // A manual figure for one CRM campaign at one market location. The rest of its channel re-shares around it. An empty amount removes it.
   'POST /api/projections/campaign': ({ body, user }) => tx(() => {
-    const c = q('SELECT c.*, b.name brand FROM campaign c JOIN brand b ON b.id = c.brand_id WHERE c.id = ?').get(num(body.campaign_id));
+    const c = q('SELECT c.*, b.name brand FROM campaign c JOIN brand b ON b.id = c.brand_id WHERE c.id = ?').get(num(body.campaign_id)), k = body.measure;
     const lo = c && q('SELECT * FROM location WHERE id = ? AND brand_id = ?').get(num(body.location_id), c.brand_id);
     need(c && lo, 'Pick a campaign and one of its brand\'s market locations');
-    c.brand = `${c.brand} · ${lo.name}`;
-    need(PROJ_MEASURES.includes(body.measure), 'Unknown measure');
+    need(PROJ_MEASURES.includes(k), 'Unknown measure');
     need(OPEN_MONTHS.includes(body.month), 'Only open months can be projected');
+    const now = projNow({ ...lo, brand: c.brand }, body.month, body.basis), i = now.months.indexOf(body.month), was = now.campaigns.find((x) => x.id === c.id)?.m[k].proj[i] || 0;
+    const where = `${c.brand} · ${lo.name} · ${c.name} · ${PROJ_NAME[k]} · ${body.month}`;
     if (body.amount === null || body.amount === '') {
-      q('DELETE FROM proj_campaign WHERE month = ? AND campaign_id = ? AND location_id = ? AND measure = ?').run(body.month, c.id, lo.id, body.measure);
-      audit(user, 'campaign override removed', `${c.brand} · ${c.name} · ${PROJ_NAME[body.measure]} · ${body.month}`);
+      q('DELETE FROM proj_campaign WHERE month = ? AND campaign_id = ? AND location_id = ? AND measure = ?').run(body.month, c.id, lo.id, k);
+      audit(user, 'projection: campaign reset', `${where}: ${projFmt(k, was)} → back to its automatic share`);
       return { ok: true };
     }
     const amount = Number(body.amount);
     need(Number.isFinite(amount) && amount >= 0, 'Amount must be zero or more');
     q('INSERT INTO proj_campaign (month, campaign_id, location_id, measure, amount) VALUES (?, ?, ?, ?, ?) ON CONFLICT (month, campaign_id, location_id, measure) DO UPDATE SET amount = excluded.amount')
-      .run(body.month, c.id, lo.id, body.measure, body.measure === 'appts' ? amount : amount / usdFx());
-    audit(user, 'campaign override', `${c.brand} · ${c.name} · ${PROJ_NAME[body.measure]} · ${body.month}: ${body.measure === 'appts' ? '' : sym()}${Math.round(amount).toLocaleString()}`);
+      .run(body.month, c.id, lo.id, k, projStore(k, amount));
+    audit(user, 'projection: campaign', `${where}: ${projFmt(k, was)} → ${projFmt(k, amount)}`);
+    return { ok: true };
+  }),
+
+  // Move a projected amount from one CRM campaign to another at the same market location and month.
+  // Both campaigns become hand-entered figures. When they sit in different channels, the channel projections move too,
+  // so every other campaign keeps the figure it had. The budget never changes.
+  'POST /api/projections/move': ({ body, user }) => tx(() => {
+    const lo = q('SELECT l.*, b.name brand FROM location l JOIN brand b ON b.id = l.brand_id WHERE l.id = ?').get(num(body.location_id)), k = body.measure;
+    need(lo, 'Pick a market location first');
+    need(PROJ_MEASURES.includes(k), 'Unknown measure');
+    need(OPEN_MONTHS.includes(body.month), 'Only open months can be changed');
+    const camp = (id) => q(`SELECT c.id, c.name, l.channel_id ch FROM campaign c JOIN level1 l ON l.id = c.level1_id WHERE c.id = ? AND c.brand_id = ? AND c.source IN ('crm', 'manual')`).get(num(id), lo.brand_id);
+    const from = camp(body.from), to = camp(body.to), amount = Number(body.amount), reason = String(body.reason || '').trim();
+    need(from && to, 'Pick a source and a destination campaign from this brand');
+    need(from.id !== to.id, 'Pick two different campaigns');
+    need(Number.isFinite(amount) && amount > 0, 'Amount must be more than zero');
+    need(reason.length >= 15, 'Give a reason of at least 15 characters; it goes in the change log');
+    const now = projNow(lo, body.month, body.basis), i = now.months.indexOf(body.month);
+    const cur = (id) => now.campaigns.find((x) => x.id === id)?.m[k].proj[i] || 0, chan = (id) => now.channels.find((x) => x.id === id)?.m[k].proj[i] || 0;
+    const a = cur(from.id), b = cur(to.id);
+    need(amount <= a + 0.5, `Only ${projFmt(k, a)} is projected on ${from.name} for that month`);
+    const putCamp = q('INSERT INTO proj_campaign (month, campaign_id, location_id, measure, amount) VALUES (?, ?, ?, ?, ?) ON CONFLICT (month, campaign_id, location_id, measure) DO UPDATE SET amount = excluded.amount');
+    putCamp.run(body.month, from.id, lo.id, k, projStore(k, Math.max(0, a - amount)));
+    putCamp.run(body.month, to.id, lo.id, k, projStore(k, b + amount));
+    if (from.ch !== to.ch) {
+      const putCh = q('INSERT INTO proj_channel (month, brand_id, location_id, channel_id, measure, amount) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (month, location_id, channel_id, measure) DO UPDATE SET amount = excluded.amount');
+      putCh.run(body.month, lo.brand_id, lo.id, from.ch, k, projStore(k, Math.max(0, chan(from.ch) - amount)));
+      putCh.run(body.month, lo.brand_id, lo.id, to.ch, k, projStore(k, chan(to.ch) + amount));
+    }
+    audit(user, 'projection: move', `${lo.brand} · ${lo.name} · ${PROJ_NAME[k]} · ${body.month}: moved ${projFmt(k, amount)} from ${from.name} (${projFmt(k, a)} → ${projFmt(k, a - amount)}) to ${to.name} (${projFmt(k, b)} → ${projFmt(k, b + amount)})${from.ch !== to.ch ? ', across channels' : ''}. Reason: ${reason}`);
     return { ok: true };
   }),
 
@@ -483,8 +545,13 @@ const routes = {
   // Totals per campaign for a date range, plus the budget pro-rated to that range.
   'GET /api/range': ({ query }) => ({
     rows: collect(query, 'all', 'cp.id', 'n.campaign_id', '1=1').rows,
-    budget: q(`SELECT p.channel_id, SUM(p.budget / k.mdays * ${fxSql('b')}) budget FROM channel_plan p JOIN cal k ON k.month = p.month JOIN brand b ON b.id = p.brand_id
-               WHERE k.day BETWEEN ? AND ? AND p.budget <> 0 AND ${inScope('p.brand_id')} ${num(query.location) ? `AND p.location_id = ${num(query.location)}` : ''} GROUP BY p.channel_id`).all(query.from, query.to),
+    budget: [...q(`SELECT l.channel_id, SUM(t.amount / k.mdays) * ${usdFx()} budget FROM budget_l1 t JOIN cal k ON k.month = t.month JOIN level1 l ON l.id = t.level1_id
+               WHERE t.measure = 'spend' AND k.day BETWEEN ? AND ? AND ${inScope('t.brand_id')} ${num(query.location) ? `AND t.location_id = ${num(query.location)}` : ''} GROUP BY l.channel_id`).all(query.from, query.to), ...q(`SELECT p.channel_id, SUM(p.budget / k.mdays * ${fxSql('b')}) budget FROM channel_plan p JOIN cal k ON k.month = p.month JOIN brand b ON b.id = p.brand_id
+               WHERE k.day BETWEEN ? AND ? AND p.budget <> 0 AND ${inScope('p.brand_id')} ${num(query.location) ? `AND p.location_id = ${num(query.location)}` : ''} GROUP BY p.channel_id`).all(query.from, query.to)],
+    // the spend budget by Level 1, and the spend projection by channel, both pro-rated to the dates asked for
+    budgetL1: q(`SELECT t.level1_id, SUM(t.amount / k.mdays) * ${usdFx()} budget FROM budget_l1 t JOIN cal k ON k.month = t.month
+                 WHERE t.measure = 'spend' AND k.day BETWEEN ? AND ? AND ${inScope('t.brand_id')} ${num(query.location) ? `AND t.location_id = ${num(query.location)}` : ''} GROUP BY t.level1_id`).all(query.from, query.to),
+    plan: spendPlan(query),
   }),
 
   // One set of totals for a date range. Used for the prior-year comparison on the KPI cards.
@@ -559,6 +626,96 @@ const routes = {
     }
     return { cols, rows, count, total: total || 0, shown: rows.length };
   },
+
+  // ---- ledger spend → CRM campaigns -----------------------------------------
+  // Ledger lines for one brand and year, grouped by Level 1 and vendor, with what is assigned, what an ad platform
+  // already covers, and a suggested campaign where one is clear. Suggestions are never applied without a click.
+  'GET /api/ledger': ({ query }) => {
+    const brand = SCOPE?.length === 1 ? SCOPE[0] : null;
+    need(brand, 'Pick one brand to assign its ledger spend');
+    const year = /^\d{4}$/.test(query.year || '') ? query.year : CLOSED_THROUGH.slice(0, 4), loc = num(query.location), fx = fxOf(brand), covered = coveredGroups(db);
+    const groups = new Map();
+    for (const g of q(`SELECT g.ext, g.level1_id l, g.month m, g.vendor, g.amount, COALESCE((SELECT SUM(a.amount) FROM gl_assign a WHERE a.ext = g.ext), 0) assigned
+                       FROM gl_line g WHERE g.brand_id = ? AND g.month LIKE ? ${loc ? `AND g.location_id = ${loc}` : ''}`).all(brand, year + '%')) {
+      const vk = norm(g.vendor || ''), k = `${g.l}|${vk}`;
+      const x = groups.get(k) || groups.set(k, { key: k, level1_id: g.l, vendor: g.vendor || '', vendor_key: vk, lines: 0, amount: 0, assigned: 0, covered: 0 }).get(k);
+      x.lines++; x.amount += g.amount * fx; x.assigned += g.assigned * fx;
+      if (covered.has(`${brand}|${g.l}|${g.m}`)) x.covered += g.amount * fx;
+    }
+    const camps = q(`SELECT c.id, c.name, c.level1_id, COALESCE((SELECT SUM(f.leads) FROM crm_name n JOIN crm_fact f ON f.crm_name_id = n.id WHERE n.campaign_id = c.id AND f.month LIKE ?), 0) leads
+                     FROM campaign c WHERE c.brand_id = ? AND c.source IN ('crm', 'manual') AND c.status IN ('live', 'approved') AND lower(c.name) NOT LIKE '(no campaign%' ORDER BY c.name`).all(year + '%', brand);
+    const rules = new Map(q('SELECT r.*, c.name campaign FROM gl_rule r JOIN campaign c ON c.id = r.campaign_id WHERE r.brand_id = ?').all(brand).map((r) => [`${r.level1_id}|${r.vendor}`, r]));
+    const generic = new Set(['google', 'other', 'website', 'internet', 'referral', 'email', 'radio', 'tv', 'events', 'event', 'facebook', 'print', 'direct mail', 'social media', 'sponsorship', 'sponsorships', 'lsa', 'organic']);
+    const out = [...groups.values()].map((g) => {
+      const open = g.amount - g.assigned - g.covered, rule = g.vendor_key ? rules.get(g.key) : null;
+      let suggest = null;
+      if (!rule && open > 0.5) {
+        const active = camps.filter((c) => c.level1_id === g.level1_id && c.leads > 0);
+        const named = g.vendor_key && camps.map((c) => ({ c, s: similarity(g.vendor, c.name), n: norm(c.name) }))
+          .filter((x) => !generic.has(x.n) && (x.s >= 0.62 || (x.n.length >= 4 && (g.vendor_key.includes(x.n) || (g.vendor_key.length >= 5 && x.n.includes(g.vendor_key))))))
+          .sort((a, b) => (b.c.level1_id === g.level1_id) - (a.c.level1_id === g.level1_id) || b.s - a.s)[0];
+        if (named) suggest = { id: named.c.id, why: `vendor name resembles the campaign${named.c.level1_id === g.level1_id ? '' : ', which is in another Level 1'}` };
+        else if (active.length === 1) suggest = { id: active[0].id, why: 'the only active CRM campaign in this Level 1' };
+      }
+      return { ...g, open, rule: rule ? { id: rule.id, campaign_id: rule.campaign_id, campaign: rule.campaign } : null, suggest };
+    }).sort((a, b) => b.open - a.open || b.amount - a.amount);
+    const tot = out.reduce((t, g) => ({ amount: t.amount + g.amount, assigned: t.assigned + g.assigned, covered: t.covered + g.covered, open: t.open + Math.max(0, g.open) }), { amount: 0, assigned: 0, covered: 0, open: 0 });
+    return { year, groups: out, totals: tot, campaigns: camps };
+  },
+
+  // The individual ledger lines behind one vendor and Level 1, each with whatever it is assigned to.
+  'GET /api/ledger/lines': ({ query }) => {
+    const brand = SCOPE?.length === 1 ? SCOPE[0] : null;
+    need(brand, 'Pick one brand');
+    const year = /^\d{4}$/.test(query.year || '') ? query.year : CLOSED_THROUGH.slice(0, 4), fx = fxOf(brand), covered = coveredGroups(db), vk = String(query.vendor || ''), loc = num(query.location);
+    const parts = new Map();
+    for (const a of q('SELECT a.ext, a.campaign_id, a.amount, a.rule_id, c.name FROM gl_assign a JOIN gl_line g ON g.ext = a.ext JOIN campaign c ON c.id = a.campaign_id WHERE g.brand_id = ?').all(brand))
+      (parts.get(a.ext) || parts.set(a.ext, []).get(a.ext)).push({ campaign_id: a.campaign_id, name: a.name, amount: a.amount * fx, rule: !!a.rule_id });
+    return q(`SELECT g.ext, g.day, g.month, lo.name location, g.vendor, g.description, g.ref, g.account, g.source, g.amount FROM gl_line g JOIN location lo ON lo.id = g.location_id
+              WHERE g.brand_id = ? AND g.level1_id = ? AND g.month LIKE ? ${loc ? `AND g.location_id = ${loc}` : ''} ORDER BY g.day DESC, g.id`).all(brand, num(query.level1), year + '%')
+      .filter((g) => norm(g.vendor || '') === vk)
+      .map((g) => ({ ...g, amount: g.amount * fx, covered: covered.has(`${brand}|${num(query.level1)}|${g.month}`), parts: parts.get(g.ext) || [] }));
+  },
+
+  // A vendor rule: every line from this vendor in this Level 1 belongs to one CRM campaign, now and on future imports.
+  // Sending no campaign removes the rule and the assignments it made.
+  'POST /api/ledger/rule': ({ body, user }) => tx(() => {
+    const brand = q('SELECT * FROM brand WHERE id = ?').get(num(body.brand_id)), l1 = q('SELECT * FROM level1 WHERE id = ?').get(num(body.level1_id)), vendor = norm(body.vendor || '');
+    need(brand && l1 && vendor, 'A rule needs a brand, a Level 1 and a vendor name');
+    if (!body.campaign_id) {
+      q('DELETE FROM gl_rule WHERE brand_id = ? AND level1_id = ? AND vendor = ?').run(brand.id, l1.id, vendor);
+      applyRules(db); rebuildUnallocated(db);
+      audit(user, 'ledger: rule removed', `${brand.name} · ${l1.name} · ${body.vendor}`);
+      return { ok: true };
+    }
+    const c = q("SELECT * FROM campaign WHERE id = ? AND brand_id = ? AND source IN ('crm', 'manual')").get(num(body.campaign_id), brand.id);
+    need(c, 'Pick a CRM campaign from this brand');
+    q(`INSERT INTO gl_rule (brand_id, level1_id, vendor, campaign_id, by_user, at) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (brand_id, level1_id, vendor) DO UPDATE SET campaign_id = excluded.campaign_id, by_user = excluded.by_user, at = excluded.at`).run(brand.id, l1.id, vendor, c.id, user, new Date().toISOString());
+    const n = applyRules(db); rebuildUnallocated(db);
+    audit(user, 'ledger: vendor rule', `${brand.name} · ${l1.name} · ${body.vendor} → ${c.name}`);
+    return { ok: true, lines: n };
+  }),
+
+  // Assign one ledger line by hand, to one campaign or split across several. Amounts need not use the whole line:
+  // whatever is left stays unassigned. Sending no parts clears the hand assignment (a vendor rule then applies again).
+  'POST /api/ledger/assign': ({ body, user }) => tx(() => {
+    const g = q('SELECT g.*, b.name brand FROM gl_line g JOIN brand b ON b.id = g.brand_id WHERE g.ext = ?').get(String(body.ext || ''));
+    need(g, 'Ledger line not found');
+    need(!coveredGroups(db).has(`${g.brand_id}|${g.level1_id}|${g.month}`), 'This line is covered by an ad-platform feed, so its campaign detail comes from the platform');
+    const fx = fxOf(g.brand_id), parts = (Array.isArray(body.parts) ? body.parts : []).map((p) => ({ campaign_id: num(p.campaign_id), amount: Number(p.amount) / fx })).filter((p) => p.campaign_id && p.amount);
+    need(parts.every((p) => Number.isFinite(p.amount) && (g.amount >= 0 ? p.amount > 0 : p.amount < 0)), g.amount >= 0 ? 'Each amount must be more than zero' : 'This line is a credit, so each amount must be negative');
+    const total = parts.reduce((a, p) => a + p.amount, 0);
+    need(Math.abs(total) <= Math.abs(g.amount) + 0.01 / fx + 0.005, `The parts add up to more than the line (${sym()}${Math.round(g.amount * fx).toLocaleString('en-US')})`);
+    const names = [];
+    for (const p of parts) { const c = q("SELECT name FROM campaign WHERE id = ? AND brand_id = ? AND source IN ('crm', 'manual')").get(p.campaign_id, g.brand_id); need(c, 'Pick CRM campaigns from this brand'); names.push(`${c.name} ${sym()}${Math.round(p.amount * fx).toLocaleString('en-US')}`); }
+    q('DELETE FROM gl_assign WHERE ext = ?').run(g.ext);
+    const ins = q('INSERT INTO gl_assign (ext, campaign_id, amount, rule_id, by_user, at) VALUES (?, ?, ?, NULL, ?, ?)');
+    for (const p of parts) ins.run(g.ext, p.campaign_id, p.amount, user, new Date().toISOString());
+    applyRules(db); rebuildUnallocated(db);
+    audit(user, parts.length > 1 ? 'ledger: line split' : parts.length ? 'ledger: line assigned' : 'ledger: line cleared', `${g.brand} · ${g.vendor || '(no vendor)'} · ${g.day || g.month} · ${sym()}${Math.round(g.amount * fx).toLocaleString('en-US')}${parts.length ? ' → ' + names.join(', ') : ''}`);
+    return { ok: true };
+  }),
 
   'GET /api/audit': () => q('SELECT * FROM audit ORDER BY id DESC LIMIT 200').all(),
 };
