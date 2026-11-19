@@ -265,6 +265,22 @@ export function buildCal(db) {
   }
 }
 
+// CRM outcomes are held on a lead-cohort basis: every outcome of a record counts on the day its lead was created.
+//   Leads        non-cloned records
+//   Appointments non-cloned, qualified records that went on to book an appointment
+//   Sales        non-cloned records that went on to be sold or completed
+//   Bookings $   final contract amount of every sold or completed record (clones included); USD for every brand
+// Built from the imported records, by day and by month, for leads created inside the span of years Maestro holds.
+export function buildOutcomes(db) {
+  const sums = 'SUM(r.clone = 0) leads, SUM(r.clone = 0 AND r.appt_day IS NOT NULL) appts, SUM(r.clone = 0 AND r.won = 1) sales, ROUND(SUM(CASE WHEN r.won = 1 THEN r.amount ELSE 0 END)) bookings';
+  const from = `FROM record r JOIN (SELECT campaign_id, MIN(id) id FROM crm_name WHERE campaign_id IS NOT NULL GROUP BY 1) n ON n.campaign_id = r.campaign_id
+    WHERE r.lead_day BETWEEN '${MONTHS[0]}-01' AND '${lastOf(MONTHS.at(-1))}' GROUP BY 1, 2, 3 HAVING leads OR appts OR sales OR bookings`;
+  db.exec(`DELETE FROM crm_day; DELETE FROM crm_fact;
+    INSERT INTO crm_day (crm_name_id, location_id, day, leads, appts, sales, bookings) SELECT n.id, r.location_id, r.lead_day, ${sums} ${from};
+    INSERT INTO crm_fact (crm_name_id, location_id, month, leads, appts, sales, bookings) SELECT n.id, r.location_id, substr(r.lead_day, 1, 7), ${sums} ${from};
+    INSERT INTO setting (key, value) VALUES ('crm_basis', 'lead') ON CONFLICT (key) DO UPDATE SET value = excluded.value;`);
+}
+
 export function openDb({ reset = false } = {}) {
   fs.mkdirSync(DIR, { recursive: true });
   const db = new DatabaseSync(FILE);
@@ -301,6 +317,16 @@ export function openDb({ reset = false } = {}) {
   db.exec('CREATE INDEX IF NOT EXISTS cal_month ON cal (month, live); CREATE INDEX IF NOT EXISTS spend_month ON spend (month); CREATE INDEX IF NOT EXISTS crm_fact_month ON crm_fact (month); CREATE INDEX IF NOT EXISTS crm_name_campaign ON crm_name (campaign_id)');
   // Databases created before spend links existed get the column added in place.
   if (!db.prepare('PRAGMA table_info(campaign)').all().some((c) => c.name === 'linked_to')) db.exec('ALTER TABLE campaign ADD COLUMN linked_to INTEGER');
+  if (!db.prepare('PRAGMA index_info(record_cohort)').all().some((c) => c.name === 'closed_day')) db.exec('DROP INDEX IF EXISTS record_cohort'); // an earlier form of it had no closed date
+  db.exec('CREATE INDEX IF NOT EXISTS record_cohort ON record (lead_day, brand_id, location_id, service, ctype, clone, won, appt_day, closed_day, amount)');
+  // Outcomes imported on the old activity basis (each outcome on its own date) are rebuilt once on the lead-cohort basis,
+  // from the records already loaded. A copy of the database as it was is kept beside it.
+  if (db.prepare('SELECT 1 FROM record LIMIT 1').get() && db.prepare("SELECT value FROM setting WHERE key = 'crm_basis'").get()?.value !== 'lead') {
+    const keep = path.join(DIR, 'maestro-before-lead-cohort.db');
+    if (!fs.existsSync(keep)) db.exec(`VACUUM INTO '${keep.replace(/'/g, "''")}'`);
+    db.exec('BEGIN');
+    try { buildOutcomes(db); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+  }
   return db;
 }
 

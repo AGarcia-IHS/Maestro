@@ -102,7 +102,7 @@ function linkRows() {
 //   1. ad-platform spend, which is known by day;
 //   2. every other campaign's monthly spend (ledger-only and reconciling lines), spread evenly over the month's days,
 //      because a ledger date is when an invoice posted, not when the advertising ran;
-//   3. CRM outcomes by their actual day;
+//   3. CRM outcomes on the day their lead was created (lead-cohort basis);
 //   4. monthly CRM outcomes for anything not held by day (demo data), spread the same way.
 // Linked ad-platform spend is counted on the CRM campaign it is linked to, as everywhere else in Insights.
 const BUCKET = { day: 'k.day', week: 'k.week', month: 'k.month', all: "'all'" };
@@ -117,12 +117,28 @@ function importFacts() {
     CREATE TEMP TABLE spend_m AS SELECT campaign_id, location_id, substr(day, 1, 7) month, SUM(amount) amount FROM spend_day GROUP BY 1, 2, 3;
     CREATE TEMP TABLE crm_m AS SELECT crm_name_id, location_id, substr(day, 1, 7) month, SUM(leads) leads, SUM(appts) appts, SUM(sales) sales, SUM(bookings) bookings FROM crm_day GROUP BY 1, 2, 3;
     CREATE INDEX temp.spend_m_month ON spend_m (month); CREATE INDEX temp.crm_m_month ON crm_m (month);`);
+  // Prior-year comparisons are like for like: a lead cohort from a year ago is counted as it stood a year before the
+  // newest lead in the CRM extract, so only appointments booked and sales closed by that date are in it. Without this a
+  // finished cohort would be set against one that is still closing.
+  const through = getThrough(db), asOf = q('SELECT MAX(lead_day) d FROM record WHERE lead_day <= ?').get(through)?.d || null, cutoff = asOf ? yearBefore(asOf) : null;
+  db.exec('DROP TABLE IF EXISTS temp.crm_day_ly; DROP TABLE IF EXISTS temp.crm_m_ly; DROP TABLE IF EXISTS temp.rec_name;');
+  if (cutoff) db.exec(`
+    CREATE TEMP TABLE rec_name AS SELECT p.campaign_id, p.brand_id, (SELECT MIN(n.id) FROM crm_name n WHERE n.brand_id = p.brand_id AND n.raw_name = c.name) name_id
+      FROM (SELECT DISTINCT campaign_id, brand_id FROM record) p JOIN campaign c ON c.id = p.campaign_id;
+    CREATE TEMP TABLE crm_day_ly AS SELECT m.name_id crm_name_id, r.location_id, r.lead_day day, SUM(r.clone = 0) leads, COALESCE(SUM(r.clone = 0 AND r.appt_day <= '${cutoff}'), 0) appts,
+        COALESCE(SUM(r.clone = 0 AND r.won = 1 AND r.closed_day <= '${cutoff}'), 0) sales, ROUND(SUM(CASE WHEN r.won = 1 AND r.closed_day <= '${cutoff}' THEN r.amount ELSE 0 END)) bookings
+      FROM record r JOIN temp.rec_name m ON m.campaign_id = r.campaign_id AND m.brand_id = r.brand_id
+      WHERE r.lead_day BETWEEN '${MONTHS[0]}-01' AND '${cutoff}' AND m.name_id IS NOT NULL GROUP BY 1, 2, 3;
+    CREATE TEMP TABLE crm_m_ly AS SELECT crm_name_id, location_id, substr(day, 1, 7) month, SUM(leads) leads, SUM(appts) appts, SUM(sales) sales, SUM(bookings) bookings FROM temp.crm_day_ly GROUP BY 1, 2, 3;
+    CREATE INDEX temp.crm_day_ly_day ON crm_day_ly (day); CREATE INDEX temp.crm_m_ly_month ON crm_m_ly (month);`);
   return (imported = {
+    asOf, cutoff,
     dayCampaigns: q('SELECT DISTINCT campaign_id id FROM spend_day').all().map((r) => r.id).join(',') || '0',
     monthNames: q('SELECT DISTINCT crm_name_id id FROM crm_fact WHERE crm_name_id NOT IN (SELECT DISTINCT crm_name_id FROM crm_day)').all().map((r) => r.id).join(','),
-    through: getThrough(db),
+    through,
   });
 }
+const yearBefore = (d) => `${Number(d.slice(0, 4)) - 1}${d.slice(4) === '-02-29' ? '-02-28' : d.slice(4)}`;
 const monthEndOf = (d) => { const e = new Date(Number(d.slice(0, 4)), Number(d.slice(5, 7)), 0); return `${d.slice(0, 7)}-${String(e.getDate()).padStart(2, '0')}`; };
 function collect(query, grain, spendKey, crmKey, where) {
   const a = query.from, b = query.to, loc = num(query.location), bk = BUCKET[grain], F = importFacts();
@@ -137,14 +153,16 @@ function collect(query, grain, spendKey, crmKey, where) {
   const cWhere = `${inScope('n.brand_id')} AND ${where}`, cLoc = loc ? `AND f.location_id = ${loc}` : '';
   const cSums = (div = '') => `SUM(f.leads${div}) leads, SUM(f.appts${div}) appts, SUM(f.sales${div}) sales, SUM(f.bookings${div}) * ${usdFx()} bookings`;
   const coarse = grain === 'all' || grain === 'month';
+  // asof: the prior-year side of a comparison, counted as it stood a year ago
+  const ly = !!(query.asof && F.cutoff), DAY = ly ? 'temp.crm_day_ly' : 'crm_day', MON = ly ? 'temp.crm_m_ly' : 'temp.crm_m';
 
   if (coarse && a.endsWith('-01') && b === monthEndOf(b) && b <= F.through) {
     // Whole months that are fully in the past: every figure comes from month totals, and no daily row is read.
     const ma = a.slice(0, 7), mb = b.slice(0, 7), sb = grain === 'month' ? 's.month' : "'all'", fb = grain === 'month' ? 'f.month' : "'all'";
     q(`SELECT ${spendKey} key, ${sb} bucket, SUM(s.amount * ${fxSql('b')}) v FROM temp.spend_m s ${sJoin} WHERE s.month BETWEEN ? AND ? AND ${sWhere} GROUP BY 1, 2`).all(ma, mb).forEach(addSpend);
     q(`SELECT ${spendKey} key, ${sb} bucket, SUM(s.actual * ${fxSql('b')}) v FROM spend s ${sJoin} WHERE s.month BETWEEN ? AND ? AND s.actual <> 0 AND s.campaign_id NOT IN (${F.dayCampaigns}) AND ${sWhere} GROUP BY 1, 2`).all(ma, mb).forEach(addSpend);
-    q(`SELECT ${crmKey} key, ${fb} bucket, ${cSums()} FROM temp.crm_m f ${cJoin} WHERE f.month BETWEEN ? AND ? ${cLoc} AND ${cWhere} GROUP BY 1, 2`).all(ma, mb).forEach(addCrm);
-    if (F.monthNames) q(`SELECT ${crmKey} key, ${fb} bucket, ${cSums()} FROM crm_fact f ${cJoin} WHERE f.month BETWEEN ? AND ? AND f.crm_name_id IN (${F.monthNames}) ${cLoc} AND ${cWhere} GROUP BY 1, 2`).all(ma, mb).forEach(addCrm);
+    q(`SELECT ${crmKey} key, ${fb} bucket, ${cSums()} FROM ${MON} f ${cJoin} WHERE f.month BETWEEN ? AND ? ${cLoc} AND ${cWhere} GROUP BY 1, 2`).all(ma, mb).forEach(addCrm);
+    if (F.monthNames && !ly) q(`SELECT ${crmKey} key, ${fb} bucket, ${cSums()} FROM crm_fact f ${cJoin} WHERE f.month BETWEEN ? AND ? AND f.crm_name_id IN (${F.monthNames}) ${cLoc} AND ${cWhere} GROUP BY 1, 2`).all(ma, mb).forEach(addCrm);
   } else {
     // 1. ad-platform spend by its day
     q(`SELECT ${spendKey} key, ${bk} bucket, SUM(s.amount * ${fxSql('b')}) v FROM spend_day s JOIN cal k ON k.day = s.day ${sJoin} WHERE k.day BETWEEN ? AND ? AND ${sWhere} GROUP BY 1, 2`).all(a, b).forEach(addSpend);
@@ -156,11 +174,11 @@ function collect(query, grain, spendKey, crmKey, where) {
         WHERE k.day BETWEEN ? AND ? AND s.actual <> 0 AND s.campaign_id NOT IN (${F.dayCampaigns}) AND ${sWhere} GROUP BY 1, 2`).all(a, b).forEach(addSpend);
     // 3. CRM outcomes by their day; for a total or months they are added up per CRM name before the look-ups
     if (coarse) q(`SELECT ${crmKey} key, f.bucket bucket, ${cSums()}
-        FROM (SELECT f.crm_name_id, f.location_id, ${grain === 'month' ? 'substr(f.day, 1, 7)' : "'all'"} bucket, SUM(f.leads) leads, SUM(f.appts) appts, SUM(f.sales) sales, SUM(f.bookings) bookings FROM crm_day f WHERE f.day BETWEEN ? AND ? ${cLoc} GROUP BY 1, 2, 3) f ${cJoin}
+        FROM (SELECT f.crm_name_id, f.location_id, ${grain === 'month' ? 'substr(f.day, 1, 7)' : "'all'"} bucket, SUM(f.leads) leads, SUM(f.appts) appts, SUM(f.sales) sales, SUM(f.bookings) bookings FROM ${DAY} f WHERE f.day BETWEEN ? AND ? ${cLoc} GROUP BY 1, 2, 3) f ${cJoin}
         WHERE ${cWhere} GROUP BY 1, 2`).all(a, b).forEach(addCrm);
-    else q(`SELECT ${crmKey} key, ${bk} bucket, ${cSums()} FROM crm_day f JOIN cal k ON k.day = f.day ${cJoin} WHERE k.day BETWEEN ? AND ? ${cLoc} AND ${cWhere} GROUP BY 1, 2`).all(a, b).forEach(addCrm);
+    else q(`SELECT ${crmKey} key, ${bk} bucket, ${cSums()} FROM ${DAY} f JOIN cal k ON k.day = f.day ${cJoin} WHERE k.day BETWEEN ? AND ? ${cLoc} AND ${cWhere} GROUP BY 1, 2`).all(a, b).forEach(addCrm);
     // 4. CRM names held only by month (demo data), spread like monthly spend
-    if (F.monthNames) q(`SELECT ${crmKey} key, ${bk} bucket, ${cSums(' / k.dim')} FROM crm_fact f JOIN cal k ON k.month = f.month AND k.live = 1 ${cJoin}
+    if (F.monthNames && !ly) q(`SELECT ${crmKey} key, ${bk} bucket, ${cSums(' / k.dim')} FROM crm_fact f JOIN cal k ON k.month = f.month AND k.live = 1 ${cJoin}
         WHERE k.day BETWEEN ? AND ? AND f.crm_name_id IN (${F.monthNames}) ${cLoc} AND ${cWhere} GROUP BY 1, 2`).all(a, b).forEach(addCrm);
   }
   return { rows: [...cells.values()], buckets: grain === 'all' ? ['all'] : q(`SELECT DISTINCT ${bk} bucket FROM cal k WHERE k.day BETWEEN ? AND ? ORDER BY 1`).all(a, b).map((r) => r.bucket) };
@@ -181,7 +199,7 @@ const projFmt = (k, v) => (k === 'appts' ? (Math.round(v * 10) / 10).toLocaleStr
 const projStore = (k, v) => (k === 'appts' ? v : v / usdFx()); // planning money is held in USD
 // The projection as it stands for one market location, used to record what a figure was before a change.
 function projNow(lo, month, basis) { SCOPE = [lo.brand_id]; return projections({ year: month.slice(0, 4), location: lo.id, basis }); }
-function projections(query) {
+function projections(query, keepLoc = false) {
   const year = /^\d{4}$/.test(query.year || '') ? query.year : CLOSED_THROUGH.slice(0, 4);
   const months = MONTHS.filter((m) => m.startsWith(year)), at = new Map(months.map((m, i) => [m, i]));
   const basis = ['t3', 't12', 'ly'].includes(query.basis) ? query.basis : 't3';
@@ -226,7 +244,10 @@ function projections(query) {
       if (mo > CLOSED_THROUGH && x[k].over[i] == null && !(x[k].budget[i] > 0) && !budgeted.has(`${brandOf.get(Number(lo))}|${k}|${i}`) && x[k].base > 0) c.m[k].fromRunRate[i] = true;
     });
   }
-  const out = { year, months, basis, hasBudget, brand: SCOPE?.length === 1 ? SCOPE[0] : null, location: loc, channels: channels.filter((c) => PROJ_MEASURES.some((k) => c.m[k].budget.some(Boolean) || c.m[k].actual.some(Boolean) || c.m[k].proj.some(Boolean))), campaigns: [], unassigned: {} };
+  // the same budget and plan before they are added up, for views that compare market locations
+  const perLoc = !keepLoc ? null : [...cells].map(([key, x]) => ({ key, budget: Object.fromEntries(PROJ_MEASURES.map((k) => [k, x[k].budget])),
+    plan: Object.fromEntries(PROJ_MEASURES.map((k) => [k, months.map((mo, i) => x[k].over[i] ?? (mo > CLOSED_THROUGH ? start(key.split('|')[0], x, k, i) : x[k].budget[i]))])) }));
+  const out = { ...(keepLoc ? { byLoc: perLoc } : {}), year, months, basis, hasBudget, brand: SCOPE?.length === 1 ? SCOPE[0] : null, location: loc, channels: channels.filter((c) => PROJ_MEASURES.some((k) => c.m[k].budget.some(Boolean) || c.m[k].actual.some(Boolean) || c.m[k].proj.some(Boolean))), campaigns: [], unassigned: {} };
   if (!out.brand) return out;
 
   // ---- campaign level, for one brand: worked out location by location, then added up ----
@@ -287,6 +308,22 @@ function spendPlan(query) {
   return [...out].map(([channel_id, o]) => ({ channel_id, ...o }));
 }
 
+// Budget and projection by market location and channel for a date range, pro-rated by day like spendPlan.
+function planByLocation(query) {
+  const share = new Map(q('SELECT month, COUNT(*) * 1.0 / MAX(mdays) f FROM cal WHERE day BETWEEN ? AND ? GROUP BY month').all(query.from, query.to).map((r) => [r.month, r.f]));
+  const out = new Map(), blank = () => ({ spend: 0, appts: 0, bookings: 0 });
+  for (const year of new Set([...share.keys()].map((m) => m.slice(0, 4)))) {
+    const p = projections({ year, location: query.location }, true);
+    for (const c of p.byLoc) {
+      const o = out.get(c.key) || out.set(c.key, { budget: blank(), plan: blank() }).get(c.key);
+      p.months.forEach((m, i) => { const f = share.get(m); if (f) for (const k of PROJ_MEASURES) { o.budget[k] += c.budget[k][i] * f; o.plan[k] += c.plan[k][i] * f; } });
+    }
+  }
+  return [...out].map(([key, o]) => { const [lo, ch] = key.split('|').map(Number); return { lo, ch, ...o }; });
+}
+const LOC_KEYS = ["s.location_id || '|' || l.channel_id", "f.location_id || '|' || COALESCE(l.channel_id, 0)"];
+const byLocation = (rows) => rows.map(({ key, bucket, ...t }) => { const [lo, ch] = String(key).split('|').map(Number); return { lo, ch, ...t }; });
+
 // ---- API -------------------------------------------------------------------
 const routes = {
   'GET /api/meta': () => ({
@@ -295,7 +332,7 @@ const routes = {
     locations: q('SELECT * FROM location ORDER BY id').all(),
     channels: q('SELECT * FROM channel ORDER BY sort').all(),
     level1: q('SELECT * FROM level1 ORDER BY id').all(),
-    months: MONTHS, years: YEARS.map(String), closedThrough: CLOSED_THROUGH, mode: getMode(db), fx: FX_CAD_USD, dataThrough: getThrough(db),
+    months: MONTHS, years: YEARS.map(String), closedThrough: CLOSED_THROUGH, mode: getMode(db), fx: FX_CAD_USD, dataThrough: getThrough(db), crmAsOf: importFacts().asOf, pyCutoff: importFacts().cutoff,
     feedStart: JSON.parse(q("SELECT value FROM setting WHERE key = 'feed_start'").get()?.value || '{}'),
   }),
 
@@ -600,6 +637,38 @@ const routes = {
     plan: spendPlan(query),
   }),
 
+  // The same totals by market location and channel, with the same period last year and the budget and projection,
+  // for the brand comparison and the "needs attention" list.
+  'GET /api/compare': ({ query }) => ({
+    rows: byLocation(collect(query, 'all', ...LOC_KEYS, '1=1').rows),
+    py: isDate(query.pfrom) && isDate(query.pto) ? byLocation(collect({ ...query, from: query.pfrom, to: query.pto, asof: 1 }, 'all', ...LOC_KEYS, '1=1').rows) : null,
+    plan: planByLocation(query),
+  }),
+
+  // Month-to-date figures for the month in progress, by market location and channel, with what is needed to estimate
+  // where the month will end: ad-platform spend so far (known by day), every other kind of spend at its average of the
+  // last three closed months (the ledger for an open month is not complete), outcomes so far, and the month's budget.
+  'GET /api/pacing': ({ query }) => {
+    const F = importFacts(), month = F.through.slice(0, 7);
+    if (month <= CLOSED_THROUGH) return { month: null };
+    const a = month + '-01', end = monthEndOf(a), loc = num(query.location), last3 = MONTHS.filter((m) => m <= CLOSED_THROUGH).slice(-3);
+    // the CRM extract can stop a few days before the spend feed
+    const crmTo = q('SELECT MAX(lead_day) d FROM record WHERE lead_day BETWEEN ? AND ?').get(a, F.through)?.d || F.through;
+    const spendTo = q('SELECT MAX(day) d FROM spend_day WHERE day BETWEEN ? AND ?').get(a, F.through)?.d || F.through;
+    const cells = new Map();
+    const cell = (lo, ch) => { const k = `${lo}|${ch}`; return cells.get(k) || cells.set(k, { lo, ch, platform: 0, other: 0, leads: 0, appts: 0, sales: 0, bookings: 0, budget: null, plan: null, b3: 0 }).get(k); };
+    const sJoin = 'JOIN campaign cp ON cp.id = s.campaign_id JOIN brand b ON b.id = cp.brand_id JOIN campaign e ON e.id = COALESCE(cp.linked_to, cp.id) JOIN level1 l ON l.id = e.level1_id';
+    const sWhere = `${inScope('cp.brand_id')} ${loc ? `AND s.location_id = ${loc}` : ''}`;
+    for (const r of q(`SELECT s.location_id lo, l.channel_id ch, SUM(s.amount * ${fxSql('b')}) v FROM spend_day s ${sJoin} WHERE s.day BETWEEN ? AND ? AND ${sWhere} GROUP BY 1, 2`).all(a, spendTo)) cell(r.lo, r.ch).platform += r.v;
+    for (const r of q(`SELECT s.location_id lo, l.channel_id ch, SUM(s.actual * ${fxSql('b')}) v FROM spend s ${sJoin} WHERE s.month IN (${last3.map((m) => `'${m}'`).join(',')}) AND s.campaign_id NOT IN (${F.dayCampaigns}) AND ${sWhere} GROUP BY 1, 2`).all()) cell(r.lo, r.ch).other += r.v / last3.length;
+    for (const r of q(`SELECT f.location_id lo, COALESCE(l.channel_id, 0) ch, SUM(f.leads) leads, SUM(f.appts) appts, SUM(f.sales) sales, SUM(f.bookings) * ${usdFx()} bookings FROM crm_day f JOIN crm_name n ON n.id = f.crm_name_id LEFT JOIN campaign e ON e.id = n.campaign_id LEFT JOIN level1 l ON l.id = e.level1_id
+        WHERE f.day BETWEEN ? AND ? AND ${inScope('n.brand_id')} ${loc ? `AND f.location_id = ${loc}` : ''} GROUP BY 1, 2`).all(a, crmTo)) Object.assign(cell(r.lo, r.ch), { leads: r.leads, appts: r.appts, sales: r.sales, bookings: r.bookings });
+    for (const p of planByLocation({ from: a, to: end, location: query.location })) Object.assign(cell(p.lo, p.ch), { budget: p.budget, plan: p.plan });
+    // the spend budget of those three months, per month, so the recent average can be moved to this month's season
+    for (const p of planByLocation({ from: last3[0] + '-01', to: monthEndOf(last3.at(-1) + '-01'), location: query.location })) cell(p.lo, p.ch).b3 = p.budget.spend / last3.length;
+    return { month, days: Number(end.slice(8)), spendTo, crmTo, rows: [...cells.values()] };
+  },
+
   // One set of totals for a date range. Used for the prior-year comparison on the KPI cards.
   'GET /api/totals': ({ query }) => collect(query, 'all', "'all'", "'all'", '1=1').rows[0] || { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 },
 
@@ -645,14 +714,12 @@ const routes = {
       return { rows: collect({ ...query, location: fl }, 'all', key[0], key[1], '1=1').rows, hasSpend: true, hasRecords };
     }
     const col = { brand: 'r.brand_id', location: 'r.location_id', service: 'r.service', ctype: 'r.ctype' }[dim];
-    const p = { a: query.from, b: query.to, svc: query.f_service || null, ct: query.f_ctype || null };
-    // Each outcome is read by its own date, from an index that carries everything the breakdown needs.
+    const cut = query.asof ? importFacts().cutoff : null, by = (col) => (cut ? `AND ${col} <= '${cut}'` : '');
+    const p = { a: query.from, b: cut && cut < query.to ? cut : query.to, svc: query.f_service || null, ct: query.f_ctype || null };
+    // Lead-cohort basis: every outcome of a record counts on its lead date, so one pass over an index that carries everything.
     const W = `${inScope('r.brand_id')} ${fl ? `AND r.location_id = ${fl}` : ''} AND (:svc IS NULL OR r.service = :svc) AND (:ct IS NULL OR r.ctype = :ct)`;
-    const rows = q(`SELECT key, SUM(leads) leads, SUM(appts) appts, SUM(sales) sales, SUM(bookings) * ${usdFx()} bookings FROM (
-        SELECT ${col} key, COUNT(*) leads, 0 appts, 0 sales, 0 bookings FROM record r WHERE r.lead_day BETWEEN :a AND :b AND r.clone = 0 AND ${W} GROUP BY 1
-        UNION ALL SELECT ${col}, 0, COUNT(*), 0, 0 FROM record r WHERE r.appt_day BETWEEN :a AND :b AND r.clone = 0 AND r.status <> 'not qualified' AND ${W} GROUP BY 1
-        UNION ALL SELECT ${col}, 0, 0, SUM(r.clone = 0), SUM(r.amount) FROM record r WHERE r.closed_day BETWEEN :a AND :b AND r.won = 1 AND ${W} GROUP BY 1)
-      GROUP BY 1`).all(p).map((r) => ({ ...r, spend: null }));
+    const rows = q(`SELECT ${col} key, SUM(r.clone = 0) leads, COALESCE(SUM(r.clone = 0 AND r.appt_day IS NOT NULL ${by('r.appt_day')}), 0) appts, COALESCE(SUM(r.clone = 0 AND r.won = 1 ${by('r.closed_day')}), 0) sales, SUM(CASE WHEN r.won = 1 ${by('r.closed_day')} THEN r.amount ELSE 0 END) * ${usdFx()} bookings
+      FROM record r INDEXED BY record_cohort WHERE r.lead_day BETWEEN :a AND :b AND ${W} GROUP BY 1`).all(p).map((r) => ({ ...r, spend: null }));
     return { rows, hasSpend: false, hasRecords };
   },
 
@@ -676,7 +743,8 @@ const routes = {
         return Object.values(r);
       });
     } else {
-      const on = { leads: ['r.lead_day', 'r.clone = 0'], appts: ['r.appt_day', "r.clone = 0 AND r.status <> 'not qualified'"], sales: ['r.closed_day', 'r.clone = 0 AND r.won = 1'], bookings: ['r.closed_day', 'r.won = 1'] }[query.measure];
+      // lead-cohort basis: the records behind a figure are the leads created in the period that reached that stage
+      const on = { leads: ['r.lead_day', 'r.clone = 0'], appts: ['r.lead_day', 'r.clone = 0 AND r.appt_day IS NOT NULL'], sales: ['r.lead_day', 'r.clone = 0 AND r.won = 1'], bookings: ['r.lead_day', 'r.won = 1'] }[query.measure];
       need(on, 'Records are available for spend, leads, appointments, sales and bookings');
       const where = `${on[0]} BETWEEN :a AND :b AND ${on[1]} AND ${inScope('r.brand_id')} ${fl ? `AND r.location_id = ${fl}` : ''} AND (:svc IS NULL OR r.service = :svc) AND (:ct IS NULL OR r.ctype = :ct)`;
       const p = { a: query.from, b: query.to, svc: query.f_service || null, ct: query.f_ctype || null };
