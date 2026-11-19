@@ -295,3 +295,8 @@ table.ztable tr.sub td { font-size: 13px; background: #fafbfc; }
 table.ztable tr.sub td:first-child { padding-left: 30px; color: var(--ink2); }
 table.ztable tr.dim td { opacity: .45; }
 table.ztable tr.sel td { background: var(--wash); font-weight: 600; }
+
+/* ---- larger filter dropdowns at the top of the page ---- */
+.filters label select { font-size: 1.6em; font-weight: 600; color: var(--ink); padding: 6px 10px; border-radius: 9px; }
+.filters label { flex: 1 1 170px; max-width: 340px; }
+@media (max-width: 720px) { .filters label select { font-size: 1.3em; } }

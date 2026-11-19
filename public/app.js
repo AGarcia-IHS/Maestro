@@ -322,6 +322,28 @@ function drawInsights(el) {
   if (un.leads) body += line('l1', '', 'Not mapped to a campaign', un, '<a href="#mappings">Map names</a>');
   body += line('total', '', 'Total', Object.assign(add({ ...tot }, un), { budget: cmpCh() }));
 
+  // The export carries every channel, Level 1 and campaign row, whatever is expanded on screen, as plain numbers.
+  const exportTable = () => {
+    const r2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : ''), div = (a, b) => (b > 0.5 ? a / b : NaN);
+    const out = [['Row', 'Channel', 'Level 1', 'Campaign', 'Brand', `Spend (${state.cur})`, `${vsName} (${state.cur})`, 'Variance %', 'Leads', 'Appointments', 'Sales', `Bookings (${state.cur})`, 'CPL', 'CPA', 'Closing rate %', 'ROAS', 'MCOB %']];
+    const put = (kind, chName, l1Name, camp, brand, t, cmp) => out.push([kind, chName, l1Name, camp, brand, r2(t.actual), cmp == null ? '' : r2(cmp), cmp > 0 ? r2((t.actual / cmp - 1) * 100) : '', Math.round(t.leads), Math.round(t.appts), Math.round(t.sales), r2(t.bookings),
+      r2(t.actual > 0 ? div(t.actual, t.leads) : NaN), r2(t.actual > 0 ? div(t.actual, t.appts) : NaN), r2(div(t.sales, t.appts) * 100), r2(div(t.bookings, t.actual)), r2(t.actual > 0 ? div(t.actual, t.bookings) * 100 : NaN)]);
+    for (const c of meta.channels) {
+      const inCh = rows.filter((r) => r.c.channel.id === c.id); if (!inCh.length) continue;
+      put('Channel', c.name, '', '', '', inCh.reduce((t, r) => add(t, r.t), zero()), cmpCh(c.id));
+      for (const l of meta.level1.filter((x) => x.channel_id === c.id)) {
+        const inL = inCh.filter((r) => r.c.level1.id === l.id); if (!inL.length) continue;
+        put('Level 1', c.name, l.name, '', '', inL.reduce((t, r) => add(t, r.t), zero()), cmpL1(l));
+        for (const r of inL.sort((a, b) => b.t.actual - a.t.actual)) put('Campaign', c.name, l.name, r.c.name, meta.brands.find((b) => b.id === r.c.brand_id)?.name || '', r.t, null);
+      }
+    }
+    if (un.leads) put('Not mapped to a campaign', '', '', '', '', un, null);
+    put('Total', '', '', '', '', add({ ...tot }, un), cmpCh());
+    const cell = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['\ufeff' + out.map((r) => r.map(cell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }));
+    a.download = `maestro-performance-${state.dFrom}-to-${state.dTo}.csv`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
   const through = meta.dataThrough, months = meta.months.filter((m) => m <= through.slice(0, 7));
   const monthOpts = (sel) => months.map((m) => `<option ${m === sel ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('');
   const off = meta.mode === 'real' ? meta.brands.filter((b) => !b.in_ledger && (!state.brand || String(b.id) === state.brand) && rows.some((r) => r.c.brand_id === b.id && r.t.actual)) : [];
@@ -352,7 +374,7 @@ function drawInsights(el) {
     </div>
     ${reconCard()}
     <div class="card"><div class="row" style="justify-content:space-between"><h2>Channel and Level 1 performance</h2>
-      <div class="row"><span class="ctl-l">Spend against</span><div class="seg upper"><button data-vs="budget" class="${vsPlan ? '' : 'on'}">Budget</button><button data-vs="plan" class="${vsPlan ? 'on' : ''}">Projection</button></div></div></div>
+      <div class="row"><span class="ctl-l">Spend against</span><div class="seg upper"><button data-vs="budget" class="${vsPlan ? '' : 'on'}">Budget</button><button data-vs="plan" class="${vsPlan ? 'on' : ''}">Projection</button></div><button id="perf-export" title="Every channel, Level 1 and campaign row for this period, as a CSV file that opens in Excel">Export CSV</button></div></div>
       <p class="sub">${rangeText}. ${vsPlan ? 'The Projection column is the current plan for these dates: hand-entered projections where they exist, otherwise the budget. Level 1 projections follow their channel.' : 'The Budget column is the budget as loaded, by channel and Level 1.'} Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
       <div class="scroll"><table>${head}${body}</table></div>${feedNote}</div>`;
 
@@ -397,6 +419,7 @@ function drawInsights(el) {
   $$('[data-measure]', el).forEach((b) => (b.onclick = () => { state.measure = b.dataset.measure; drawInsights(el); }));
   $$('[data-vs]', el).forEach((b) => (b.onclick = () => { state.vsMode = b.dataset.vs; drawInsights(el); }));
   $$('[data-zoom]', el).forEach((b) => (b.onclick = () => openZoom(b.dataset.zoom)));
+  $('#perf-export', el).onclick = exportTable;
   $$('tr[data-key]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); drawInsights(el); }));
 }
 
