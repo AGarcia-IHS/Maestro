@@ -239,6 +239,10 @@ CREATE TABLE IF NOT EXISTS record (id TEXT, brand_id INTEGER NOT NULL, location_
 CREATE INDEX IF NOT EXISTS record_lead ON record (lead_day);
 CREATE INDEX IF NOT EXISTS record_appt ON record (appt_day);
 CREATE INDEX IF NOT EXISTS record_closed ON record (closed_day);
+-- the Zoom breakdowns read only these indexes, never the records themselves
+CREATE INDEX IF NOT EXISTS record_lead_z ON record (lead_day, clone, brand_id, location_id, service, ctype);
+CREATE INDEX IF NOT EXISTS record_appt_z ON record (appt_day, clone, status, brand_id, location_id, service, ctype);
+CREATE INDEX IF NOT EXISTS record_closed_z ON record (closed_day, won, clone, brand_id, location_id, service, ctype, amount);
 CREATE TABLE IF NOT EXISTS gl_line (id INTEGER PRIMARY KEY, month TEXT NOT NULL, day TEXT, brand_id INTEGER NOT NULL, location_id INTEGER NOT NULL, level1_id INTEGER NOT NULL,
   account TEXT, vendor TEXT, description TEXT, ref TEXT, amount REAL NOT NULL, source TEXT, ext TEXT); -- ext: the line's own id in its ledger, stable across re-imports
 CREATE TABLE IF NOT EXISTS gl_rule (id INTEGER PRIMARY KEY, brand_id INTEGER NOT NULL, level1_id INTEGER NOT NULL, vendor TEXT NOT NULL, campaign_id INTEGER NOT NULL, by_user TEXT, at TEXT, UNIQUE (brand_id, level1_id, vendor));
@@ -293,6 +297,8 @@ export function openDb({ reset = false } = {}) {
   if (!db.prepare('SELECT 1 FROM cal WHERE day = ?').get(MONTHS[0] + '-01')) buildCal(db); // also rebuilds when the span of years changes
   if (!db.prepare('PRAGMA table_info(gl_line)').all().some((c) => c.name === 'ext')) db.exec('ALTER TABLE gl_line ADD COLUMN ext TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS gl_line_ext ON gl_line (ext)');
+  // month look-ups for the monthly figures that are spread over a month's days
+  db.exec('CREATE INDEX IF NOT EXISTS cal_month ON cal (month, live); CREATE INDEX IF NOT EXISTS spend_month ON spend (month); CREATE INDEX IF NOT EXISTS crm_fact_month ON crm_fact (month)');
   // Databases created before spend links existed get the column added in place.
   if (!db.prepare('PRAGMA table_info(campaign)').all().some((c) => c.name === 'linked_to')) db.exec('ALTER TABLE campaign ADD COLUMN linked_to INTEGER');
   return db;

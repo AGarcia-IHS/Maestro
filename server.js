@@ -3,6 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
 import { openDb, MONTHS, YEARS, CLOSED_THROUGH, FX_CAD_USD, REGIONS, divisionOf, getMode, getThrough } from './db.js';
 import { listFolder, runImport, coveredGroups, applyRules, rebuildUnallocated } from './lib/importers.js';
 
@@ -545,12 +546,12 @@ const routes = {
   // Totals per campaign for a date range, plus the budget pro-rated to that range.
   'GET /api/range': ({ query }) => ({
     rows: collect(query, 'all', 'cp.id', 'n.campaign_id', '1=1').rows,
-    budget: [...q(`SELECT l.channel_id, SUM(t.amount / k.mdays) * ${usdFx()} budget FROM budget_l1 t JOIN cal k ON k.month = t.month JOIN level1 l ON l.id = t.level1_id
-               WHERE t.measure = 'spend' AND k.day BETWEEN ? AND ? AND ${inScope('t.brand_id')} ${num(query.location) ? `AND t.location_id = ${num(query.location)}` : ''} GROUP BY l.channel_id`).all(query.from, query.to), ...q(`SELECT p.channel_id, SUM(p.budget / k.mdays * ${fxSql('b')}) budget FROM channel_plan p JOIN cal k ON k.month = p.month JOIN brand b ON b.id = p.brand_id
-               WHERE k.day BETWEEN ? AND ? AND p.budget <> 0 AND ${inScope('p.brand_id')} ${num(query.location) ? `AND p.location_id = ${num(query.location)}` : ''} GROUP BY p.channel_id`).all(query.from, query.to)],
+    budget: [...q(`SELECT l.channel_id, SUM(t.amount * k.f) * ${usdFx()} budget FROM budget_l1 t JOIN (SELECT month, COUNT(*) * 1.0 / MAX(mdays) f FROM cal WHERE day BETWEEN ? AND ? GROUP BY month) k ON k.month = t.month JOIN level1 l ON l.id = t.level1_id
+               WHERE t.measure = 'spend' AND ${inScope('t.brand_id')} ${num(query.location) ? `AND t.location_id = ${num(query.location)}` : ''} GROUP BY l.channel_id`).all(query.from, query.to), ...q(`SELECT p.channel_id, SUM(p.budget * k.f * ${fxSql('b')}) budget FROM channel_plan p JOIN (SELECT month, COUNT(*) * 1.0 / MAX(mdays) f FROM cal WHERE day BETWEEN ? AND ? GROUP BY month) k ON k.month = p.month JOIN brand b ON b.id = p.brand_id
+               WHERE p.budget <> 0 AND ${inScope('p.brand_id')} ${num(query.location) ? `AND p.location_id = ${num(query.location)}` : ''} GROUP BY p.channel_id`).all(query.from, query.to)],
     // the spend budget by Level 1, and the spend projection by channel, both pro-rated to the dates asked for
-    budgetL1: q(`SELECT t.level1_id, SUM(t.amount / k.mdays) * ${usdFx()} budget FROM budget_l1 t JOIN cal k ON k.month = t.month
-                 WHERE t.measure = 'spend' AND k.day BETWEEN ? AND ? AND ${inScope('t.brand_id')} ${num(query.location) ? `AND t.location_id = ${num(query.location)}` : ''} GROUP BY t.level1_id`).all(query.from, query.to),
+    budgetL1: q(`SELECT t.level1_id, SUM(t.amount * k.f) * ${usdFx()} budget FROM budget_l1 t JOIN (SELECT month, COUNT(*) * 1.0 / MAX(mdays) f FROM cal WHERE day BETWEEN ? AND ? GROUP BY month) k ON k.month = t.month
+                 WHERE t.measure = 'spend' AND ${inScope('t.brand_id')} ${num(query.location) ? `AND t.location_id = ${num(query.location)}` : ''} GROUP BY t.level1_id`).all(query.from, query.to),
     plan: spendPlan(query),
   }),
 
@@ -600,13 +601,12 @@ const routes = {
     }
     const col = { brand: 'r.brand_id', location: 'r.location_id', service: 'r.service', ctype: 'r.ctype' }[dim];
     const p = { a: query.from, b: query.to, svc: query.f_service || null, ct: query.f_ctype || null };
-    const rows = q(`SELECT ${col} key,
-        SUM(r.clone = 0 AND r.lead_day BETWEEN :a AND :b) leads,
-        SUM(r.clone = 0 AND r.status <> 'not qualified' AND r.appt_day BETWEEN :a AND :b) appts,
-        SUM(r.clone = 0 AND r.won = 1 AND r.closed_day BETWEEN :a AND :b) sales,
-        SUM(CASE WHEN r.won = 1 AND r.closed_day BETWEEN :a AND :b THEN r.amount ELSE 0 END) * ${usdFx()} bookings
-      FROM record r WHERE (r.lead_day BETWEEN :a AND :b OR r.appt_day BETWEEN :a AND :b OR r.closed_day BETWEEN :a AND :b)
-        AND ${inScope('r.brand_id')} ${fl ? `AND r.location_id = ${fl}` : ''} AND (:svc IS NULL OR r.service = :svc) AND (:ct IS NULL OR r.ctype = :ct)
+    // Each outcome is read by its own date, from an index that carries everything the breakdown needs.
+    const W = `${inScope('r.brand_id')} ${fl ? `AND r.location_id = ${fl}` : ''} AND (:svc IS NULL OR r.service = :svc) AND (:ct IS NULL OR r.ctype = :ct)`;
+    const rows = q(`SELECT key, SUM(leads) leads, SUM(appts) appts, SUM(sales) sales, SUM(bookings) * ${usdFx()} bookings FROM (
+        SELECT ${col} key, COUNT(*) leads, 0 appts, 0 sales, 0 bookings FROM record r WHERE r.lead_day BETWEEN :a AND :b AND r.clone = 0 AND ${W} GROUP BY 1
+        UNION ALL SELECT ${col}, 0, COUNT(*), 0, 0 FROM record r WHERE r.appt_day BETWEEN :a AND :b AND r.clone = 0 AND r.status <> 'not qualified' AND ${W} GROUP BY 1
+        UNION ALL SELECT ${col}, 0, 0, SUM(r.clone = 0), SUM(r.amount) FROM record r WHERE r.closed_day BETWEEN :a AND :b AND r.won = 1 AND ${W} GROUP BY 1)
       GROUP BY 1`).all(p).map((r) => ({ ...r, spend: null }));
     return { rows, hasSpend: false, hasRecords };
   },
@@ -751,6 +751,15 @@ function readBody(req) {
   });
 }
 
+// Answers to read requests are kept until the data changes: any change made in the app clears them, and so does a
+// change made by another program (the command-line import), which SQLite reports through data_version.
+// A few seconds after it starts, Windows moves a program with no window in front to the processor's efficiency cores,
+// which makes every query here about three times slower. Ask it not to, for this process only. If that fails the app
+// still works, just more slowly.
+if (process.platform === 'win32') execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(path.dirname(fileURLToPath(import.meta.url)), 'lib', 'fullspeed.ps1'), '-ProcessId', String(process.pid)], { windowsHide: true }, () => {});
+const answers = new Map();
+let dataVersion = null;
+const NOT_KEPT = new Set(['/api/import']); // reads the import folder on disk
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const send = (code, body, type = 'application/json') => { res.writeHead(code, { 'Content-Type': `${type}; charset=utf-8`, 'Cache-Control': 'no-store' }); res.end(body); };
@@ -758,11 +767,18 @@ http.createServer(async (req, res) => {
   if (handler) {
     try {
       const body = req.method === 'POST' ? await readBody(req) : {};
+      const v = q('PRAGMA data_version').get().data_version;
+      if (v !== dataVersion || req.method === 'POST') { answers.clear(); dataVersion = v; }
+      const keep = req.method === 'GET' && !NOT_KEPT.has(url.pathname) && url.searchParams.get('format') !== 'csv';
+      const key = `${req.headers['x-maestro-currency'] || ''}|${req.headers['x-maestro-role'] || ''}|${req.url}`;
+      if (keep && answers.has(key)) return send(200, answers.get(key));
       CUR = (req.headers['x-maestro-currency'] || url.searchParams.get('cur')) === 'CAD' ? 'CAD' : 'USD';
       SCOPE = scopeOf({ ...Object.fromEntries(url.searchParams), ...(req.method === 'POST' ? { brand: body.brand, region: body.region, division: body.division } : {}) });
       const result = handler({ query: Object.fromEntries(url.searchParams), body, user: req.headers['x-maestro-user'] || 'Demo user', role: req.headers['x-maestro-role'] || 'marketer' });
       if (result?.csv != null) { res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${result.filename}"`, 'Cache-Control': 'no-store' }); return res.end('\ufeff' + result.csv); }
-      send(200, JSON.stringify(result));
+      const json = JSON.stringify(result);
+      if (req.method === 'POST') answers.clear(); else if (keep) { if (answers.size > 400) answers.clear(); answers.set(key, json); }
+      send(200, json);
     } catch (e) {
       if (!(e instanceof Bad)) console.error(e);
       send(e instanceof Bad ? 400 : 500, JSON.stringify({ error: e instanceof Bad ? e.message : 'Server error' }));
