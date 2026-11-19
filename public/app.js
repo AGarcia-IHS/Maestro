@@ -17,7 +17,7 @@ const PLATFORM_NAME = { google_ads: 'Google Ads', bing_ads: 'Bing Ads', meta_ads
 const ROLES = { marketer: 'Marketing manager (demo)', approver: 'Approver (demo)', finance: 'Finance (demo)' };
 
 const saved = (() => { try { return localStorage.getItem('maestro-currency'); } catch { return null; } })();
-const state = { ledger: { show: 'open', q: '' }, vsMode: 'budget', chartMode: 'channel', pMeasure: 'spend', pBasis: 't3', pOpen: new Set(), grain: 'month', dateMode: 'months', dFrom: '', dTo: '', rangeYear: '', prevRange: null, division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
+const state = { perfSort: null, ledger: { show: 'open', q: '' }, vsMode: 'budget', chartMode: 'channel', pMeasure: 'spend', pBasis: 't3', pOpen: new Set(), grain: 'month', dateMode: 'months', dFrom: '', dTo: '', rangeYear: '', prevRange: null, division: '', region: '', hiddenCh: new Set(), year: '', cur: saved === 'CAD' ? 'CAD' : 'USD', brand: '', location: '', role: 'marketer', measure: 'spend', from: null, to: null, open: new Set(), mapTab: 'names', glMonth: null };
 let meta, facts;
 
 async function api(path, body) {
@@ -83,12 +83,24 @@ const bucketLabel = { month: (k, bw = 99) => (bw >= 70 ? `${mlabel(k)} ${k.slice
 const bucketTitle = { month: (k) => `${mlabel(k)} ${k.slice(0, 4)}`, week: (k) => `Week of ${niceDay(k)}`, day: (k) => toDate(k).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) };
 const bucketSpan = { month: (k) => [monthStart(k), monthEnd(k)], week: (k) => [k, addDays(k, 6)], day: (k) => [k, k] };
 
+// ---- sortable tables ---------------------------------------------------------
+// sort is { k, dir } (dir -1 = largest first). get[k] reads the value to sort on from a row. Blanks always go last.
+function sortRows(rows, sort, get) {
+  if (!sort || !get[sort.k]) return rows;
+  const f = get[sort.k], blank = (v) => v == null || (typeof v === 'number' && !Number.isFinite(v));
+  return rows.sort((a, b) => { const x = f(a), y = f(b); if (blank(x) || blank(y)) return blank(x) - blank(y); return (typeof x === 'string' ? x.localeCompare(y) : x - y) * sort.dir; });
+}
+const sortMark = (sort, k) => (sort?.k === k ? (sort.dir < 0 ? ' ▼' : ' ▲') : '');
+// What a click on heading k does to the current sort. With "off", a third click returns to the default order.
+const nextSort = (sort, k, off) => (sort?.k !== k ? { k, dir: k === 'name' ? 1 : -1 } : off && sort.dir === (k === 'name' ? -1 : 1) ? null : { k, dir: -sort.dir });
+const changeOn = (now, before) => (now != null && before != null && Math.abs(before) > 1e-9 ? now / before - 1 : null);
+
 // ---- chart -----------------------------------------------------------------
 // Stacked bars drawn at the real pixel width of their container and redrawn when that changes.
 // A click on a bar and a double-click on a colour are told apart by a short delay.
 function stackedChart(host, opts) {
-  const { buckets, series, markers, fmt, label, title, onBucket, onSeries, hint, line, compare, compareName } = opts;
-  const W = Math.max(300, Math.round(host.clientWidth || 960)), H = Math.round(Math.min(440, Math.max(230, W * 0.34)));
+  const { buckets, series, markers, fmt, label, title, onBucket, onSeries, hint, line, compare, compareName, noTotal, small } = opts;
+  const W = Math.max(300, Math.round(host.clientWidth || 960)), H = Math.round(Math.min(440, Math.max(small ? 190 : 230, W * (small ? 0.46 : 0.34))));
   const L = W < 520 ? 46 : 62, R = 14, T = 24, B = 32, pw = W - L - R, ph = H - T - B, n = Math.max(1, buckets.length);
   const totals = buckets.map((_, i) => series.reduce((a, s) => a + Math.max(0, s.values[i]), 0));
   const peak = line ? Math.max(0, ...series.flatMap((s) => s.values)) : Math.max(0, ...totals);
@@ -103,8 +115,11 @@ function stackedChart(host, opts) {
   if (line) {
     // Days read better as lines: one per series, with a point on each day when there is room.
     for (const s of series) {
-      svg += `<path d="M${s.values.map((v, i) => `${cx(i).toFixed(1)},${y(Math.max(0, v)).toFixed(1)}`).join(' L')}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
-      if (n <= 45) svg += s.values.map((v, i) => `<circle cx="${cx(i)}" cy="${y(Math.max(0, v))}" r="3" fill="${s.color}" stroke="var(--surface)" stroke-width="1.5"/>`).join('');
+      // an interval with no figure (a ratio with nothing to divide by) breaks the line rather than dropping to zero
+      let d = '', pen = false;
+      s.values.forEach((v, i) => { if (v == null) { pen = false; return; } d += `${pen ? ' L' : ' M'}${cx(i).toFixed(1)},${y(Math.max(0, v)).toFixed(1)}`; pen = true; });
+      svg += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.bold ? 3.5 : 2}" stroke-linejoin="round" stroke-linecap="round"/>`;
+      if (n <= 45) svg += s.values.map((v, i) => (v == null ? '' : `<circle cx="${cx(i)}" cy="${y(Math.max(0, v))}" r="${s.bold ? 4 : 3}" fill="${s.color}" stroke="var(--surface)" stroke-width="1.5"/>`)).join('');
     }
     buckets.forEach((_, i) => stacks.push(series.map((s) => ({ id: s.id, at: y(Math.max(0, s.values[i])) }))));
   } else buckets.forEach((b, i) => {
@@ -124,7 +139,7 @@ function stackedChart(host, opts) {
   if (compare && compare.some((v) => v != null)) {
     const pts = compare.map((v, i) => (v == null ? null : [cx(i), y(v)])).filter(Boolean);
     svg += `<path d="M${pts.map((p) => p.map((v) => v.toFixed(1)).join(',')).join(' L')}" fill="none" stroke="var(--py)" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round"/>`;
-    if (n <= 62) svg += pts.map(([px, py]) => `<circle cx="${px}" cy="${py}" r="4" fill="var(--py)" stroke="var(--surface)" stroke-width="2"/>`).join('');
+    if (n <= (small ? 16 : 62)) svg += pts.map(([px, py]) => `<circle cx="${px}" cy="${py}" r="${small ? 3 : 4}" fill="var(--py)" stroke="var(--surface)" stroke-width="${small ? 1.5 : 2}"/>`).join('');
   }
   buckets.forEach((b, i) => {
     if (i % every === 0) svg += `<text class="ax" x="${cx(i)}" y="${H - 10}" text-anchor="middle">${label(b, bw)}</text>`;
@@ -148,7 +163,7 @@ function stackedChart(host, opts) {
     const at = segAt(e);
     tip.innerHTML = `<b>${title(buckets[i])}</b>` +
       series.filter((s) => s.values[i]).map((s) => `<div ${at?.id === s.id ? 'style="font-weight:700"' : ''}><span><i class="dot" style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.values[i])}</span></div>`).join('') +
-      `<div><span><b style="display:inline">Total</b></span><span><b style="display:inline">${fmt(totals[i])}</b></span></div>` +
+      (noTotal ? '' : `<div><span><b style="display:inline">Total</b></span><span><b style="display:inline">${fmt(totals[i])}</b></span></div>`) +
       (compare && compare[i] != null ? `<div><span><i class="dot" style="background:var(--py);border-radius:50%"></i>${compareName || 'Prior year'}</span><span>${fmt(compare[i])}</span></div>` : '') +
       (markers ? `<div><span>Budget</span><span>${fmt(markers[i])}</span></div>` : '') + (hint ? `<div style="margin-top:4px"><span>${hint}</span></div>` : '');
     const box = host.getBoundingClientRect(); tip.style.display = 'block';
@@ -161,20 +176,59 @@ function stackedChart(host, opts) {
 }
 // Turn series rows from the server into chart series for one measure.
 function pivot(data, measure, names, colorOf) {
-  const idx = new Map(data.buckets.map((b, i) => [b, i])), by = new Map();
+  const idx = new Map(data.buckets.map((b, i) => [b, i])), by = new Map(), rt = RATIO_OF[measure];
   for (const r of data.rows) {
     if (r.key == null) continue;
-    const s = by.get(r.key) || by.set(r.key, { id: r.key, name: names(r.key), values: data.buckets.map(() => 0), total: { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 } }).get(r.key);
-    s.values[idx.get(r.bucket)] += r[measure] || 0;
+    const s = by.get(r.key) || by.set(r.key, { id: r.key, name: names(r.key), values: data.buckets.map(() => 0), den: data.buckets.map(() => 0), total: { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 } }).get(r.key);
+    if (rt) { s.values[idx.get(r.bucket)] += r[rt[0]] || 0; s.den[idx.get(r.bucket)] += r[rt[1]] || 0; } else s.values[idx.get(r.bucket)] += r[measure] || 0;
     for (const k in s.total) s.total[k] += r[k] || 0;
   }
-  return [...by.values()].map((s) => ({ ...s, color: colorOf(s.id) }));
+  return [...by.values()].map((s) => ({ ...s, values: rt ? s.values.map((v, i) => (s.den[i] > 0.5 ? v / s.den[i] : null)) : s.values, color: colorOf(s.id) }));
 }
 
 // ---- Insights --------------------------------------------------------------
 const MEASURES = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', sales: 'Sales', bookings: 'Bookings $' };
 const rangeQuery = () => scope() + `&from=${state.dFrom}&to=${state.dTo}`;
 let ins = null; // what the Insights screen last loaded
+// ---- chart measures ----------------------------------------------------------
+// The trend chart can show the five funnel stages or the five ratios. Ratios cannot be stacked, so they are drawn as lines.
+const RATIO_NAMES = { cpl: 'CPL', cpa: 'CPA', mcob: 'MCOB', conv: 'Conversion', close: 'Closing rate' };
+const CHART_MEASURES = { ...MEASURES, ...RATIO_NAMES };
+const mfmt = (m) => (m === 'spend' || m === 'bookings' ? compact : m === 'cpl' || m === 'cpa' ? money : RATIO_OF[m] ? pct : int);
+// One figure per interval for everything in a series response (optionally one channel, or all but the hidden ones).
+function seriesTotal(data, measure, keep = () => true) {
+  const idx = new Map(data.buckets.map((b, i) => [b, i])), rt = RATIO_OF[measure], top = data.buckets.map(() => 0), den = data.buckets.map(() => 0);
+  for (const r of data.rows) { if (r.key == null || !keep(r.key)) continue; const i = idx.get(r.bucket); if (rt) { top[i] += r[rt[0]] || 0; den[i] += r[rt[1]] || 0; } else top[i] += r[measure] || 0; }
+  return rt ? top.map((v, i) => (den[i] > 0.5 ? v / den[i] : null)) : top;
+}
+// Each channel against the same period last year: one small chart per channel, this year in the channel's colour and
+// last year as the dashed line, so every channel is read on its own scale.
+function pyCharts(host, el) {
+  host._ro?.disconnect();
+  const m = state.measure, g = state.grain, rt = RATIO_OF[m], fmt = mfmt(m), P = ins.pySeries;
+  if (!P) { host.innerHTML = '<p class="sub" style="padding:28px 0;margin:0">There is no prior-year data loaded for these dates.</p>'; return; }
+  const sums = (data, keep) => { const t = { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 }; for (const r of data.rows) if (r.key != null && keep(r.key)) for (const k in t) t[k] += r[k] || 0; return t; };
+  const figure = (t) => (rt ? ratioOf(t, m) : t[m]);
+  const align = (vals) => ins.series.buckets.map((_, i) => (i < vals.length ? vals[i] : null));
+  const shown = (id) => !state.hiddenCh.has(id);
+  const panels = [{ id: 'all', name: 'All channels', color: 'var(--ink)', keep: shown }, ...meta.channels.map((c, i) => ({ id: c.id, name: c.name, color: COLORS[i], keep: (k) => k === c.id })).filter((p) => shown(p.id))]
+    .map((p) => ({ ...p, now: figure(sums(ins.series, p.keep)), before: figure(sums(P, p.keep)), values: seriesTotal(ins.series, m, p.keep), py: align(seriesTotal(P, m, p.keep)) }))
+    .filter((p) => p.now || p.before);
+  const chip = (p) => {
+    if (p.now == null || p.before == null || !(Math.abs(p.before) > 1e-9)) return '<span class="muted">no prior year</span>';
+    const d = p.now / p.before - 1, up = d >= 0, cls = m === 'spend' ? 'flat' : up !== !!KPIS[m]?.lowGood ? 'up' : 'down';
+    return `<span class="zpy ${cls}">${up ? '▲ +' : '▼ −'}${(Math.abs(d) * 100).toFixed(1)}%</span>`;
+  };
+  host.innerHTML = `<div class="pygrid">${panels.map((p, i) => `<div class="pyp"><div class="pyp-h"><span><i class="dot" style="background:${p.color}"></i><b>${esc(p.name)}</b></span>
+    <span>${p.now == null ? '—' : fmt(p.now)} <span class="muted">vs ${p.before == null ? '—' : fmt(p.before)}</span> ${chip(p)}</span></div><div class="chart" data-pyc="${i}"></div></div>`).join('') || '<p class="sub" style="padding:28px 0;margin:0">Nothing to show for this selection.</p>'}</div>`;
+  panels.forEach((p, i) => stackedChart($(`[data-pyc="${i}"]`, host), {
+    buckets: ins.series.buckets, series: [{ id: p.id, name: 'This year', color: p.color, values: p.values }], fmt, line: g === 'day' || !!rt, noTotal: true, small: true,
+    compare: p.py, compareName: 'Last year', label: bucketLabel[g], title: bucketTitle[g], hint: p.id === 'all' ? '' : 'Double-click to break it down by Level 1',
+    onSeries: p.id === 'all' ? null : () => openDrill([{ group: 'level1', id: p.id, name: p.name }]),
+  }));
+}
+
+
 const yearBack = (d) => { const y = Number(d.slice(0, 4)) - 1, rest = d.slice(4) === '-02-29' ? '-02-28' : d.slice(4); return y + rest; };
 // "VS. PY" chips in the portal's style: the change in the figure and in percent against the same dates last year.
 function pyChips(now, before, { fmt, goodWhenUp = true, neutral = false, points = false }) {
@@ -223,7 +277,7 @@ function reconCard() {
 
 async function insights(el) {
   const closedMonths = yearMonths().filter(closed);
-  if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Projections screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
+  if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Budget Manager screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
   if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
   const pyFrom = yearBack(state.dFrom), pyTo = yearBack(state.dTo), hasPy = pyFrom >= meta.months[0] + '-01';
   const [f, range, series, py, pySeries, recon] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
@@ -231,7 +285,7 @@ async function insights(el) {
     hasPy ? api(`/api/series?${scope()}&from=${pyFrom}&to=${pyTo}&grain=${state.grain}&group=channel`) : null,
     api(`/api/recon?${scope()}&year=${state.year}`)]);
   facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo, recon };
-  if (state.chartMode === 'compare') ins.plan = await api(`/api/projections?${scope()}&year=${state.year}`);
+  if (state.chartMode === 'budget') ins.plan = await api(`/api/projections?${scope()}&year=${state.year}`);
   drawInsights(el);
 }
 function drawInsights(el) {
@@ -266,25 +320,33 @@ function drawInsights(el) {
   // Each KPI card carries a small trend of the metric across the chart's current intervals.
   const spark = (m) => {
     const idx = new Map(ins.series.buckets.map((k, i) => [k, i])), top = ins.series.buckets.map(() => 0), bottom = ins.series.buckets.map(() => 0);
-    for (const r of ins.series.rows) { const i = idx.get(r.bucket); if (m === 'roas') { top[i] += r.bookings; bottom[i] += r.spend; } else top[i] += r[m] || 0; }
-    const vals = m === 'roas' ? top.map((x, i) => (bottom[i] > 0.5 ? x / bottom[i] : 0)) : top, max = Math.max(...vals, 1e-9);
+    const rt = RATIO_OF[m];
+    for (const r of ins.series.rows) { const i = idx.get(r.bucket); if (rt) { top[i] += r[rt[0]] || 0; bottom[i] += r[rt[1]] || 0; } else top[i] += r[m] || 0; }
+    const vals = rt ? top.map((x, i) => (bottom[i] > 0.5 ? x / bottom[i] : 0)) : top, max = Math.max(...vals, 1e-9);
     if (vals.length < 2) return '';
     const pts = vals.map((x, i) => `${((i / (vals.length - 1)) * 100).toFixed(2)},${(30 - (Math.max(0, x) / max) * 26).toFixed(2)}`);
     return `<svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><path class="area" d="M0,32 L${pts.join(' L')} L100,32 Z"/><path class="line" d="M${pts.join(' L')}"/></svg>`;
   };
-  const P = ins.py, roasOf = (b, s) => (s > 0.5 ? b / s : null);
+  const P = ins.py, now = { ...all, spend: tot.actual }, days = Math.round((toDate(state.dTo) - toDate(state.dFrom)) / 864e5) + 1;
+  const rate = (t, m) => (t && t[RATIO_OF[m][1]] > 0.5 ? t[RATIO_OF[m][0]] / t[RATIO_OF[m][1]] : null), pts = (x) => (x * 100).toFixed(1) + ' pts', perDay = (n) => `${(n / days).toFixed(n / days < 10 ? 1 : 0)} per day`;
   const py = {
     spend: pyChips(tot.actual, P?.spend, { fmt: compact, neutral: true }), leads: pyChips(all.leads, P?.leads, { fmt: int }), appts: pyChips(all.appts, P?.appts, { fmt: int }),
     sales: pyChips(all.sales, P?.sales, { fmt: int }), bookings: pyChips(all.bookings, P?.bookings, { fmt: compact }),
-    roas: pyChips(roasOf(all.bookings, tot.actual), P ? roasOf(P.bookings, P.spend) : null, { fmt: (x) => x.toFixed(1) + 'x' }),
+    mcob: pyChips(rate(now, 'mcob'), rate(P, 'mcob'), { fmt: pts, goodWhenUp: false }), cpl: pyChips(rate(now, 'cpl'), rate(P, 'cpl'), { fmt: money, goodWhenUp: false }), cpa: pyChips(rate(now, 'cpa'), rate(P, 'cpa'), { fmt: money, goodWhenUp: false }),
+    close: pyChips(rate(now, 'close'), rate(P, 'close'), { fmt: pts }), conv: pyChips(rate(now, 'conv'), rate(P, 'conv'), { fmt: pts }),
   };
   const tiles = [
     ['spend', compact(tot.actual), tot.budget ? `<span class="${v > 0 ? 'down' : 'up'}">${v > 0 ? '▲' : '▼'} ${pct(Math.abs(v))}</span> vs budget ${compact(tot.budget)}` : 'No budget loaded yet'],
-    ['leads', int(all.leads), `CPL ${cost(tot.actual, all.leads)}`],
-    ['appts', int(all.appts), `CPA ${cost(tot.actual, all.appts)}`],
-    ['sales', int(all.sales), `Closing rate ${ratio(all.sales, all.appts, pct)}`],
-    ['bookings', compact(all.bookings), `Conversion ${ratio(all.appts, all.leads, pct)} lead → appt`],
-    ['roas', ratio(all.bookings, tot.actual, (x) => x.toFixed(1) + 'x'), `MCOB ${ratio(tot.actual, all.bookings, pct)}`],
+    ['leads', int(all.leads), perDay(all.leads)],
+    ['appts', int(all.appts), perDay(all.appts)],
+    ['sales', int(all.sales), perDay(all.sales)],
+    ['bookings', compact(all.bookings), `Average sale ${cost(all.bookings, all.sales)}`],
+    // second row: the ratio that belongs under each card above
+    ['mcob', ratio(tot.actual, all.bookings, pct), `Spend ÷ bookings · ROAS ${ratio(all.bookings, tot.actual, (x) => x.toFixed(1) + 'x')}`],
+    ['cpl', cost(tot.actual, all.leads), 'Spend ÷ leads'],
+    ['cpa', cost(tot.actual, all.appts), 'Spend ÷ appointments'],
+    ['close', ratio(all.sales, all.appts, pct), 'Sales ÷ appointments'],
+    ['conv', ratio(all.appts, all.leads, pct), 'Appointments ÷ leads'],
   ];
   const wholeMonths = state.dFrom.endsWith('-01') && state.dTo === monthEnd(state.dTo.slice(0, 7));
   const rangeText = wholeMonths ? (state.dFrom.slice(0, 7) === state.dTo.slice(0, 7) ? bucketTitle.month(state.dFrom.slice(0, 7)) : `${bucketTitle.month(state.dFrom.slice(0, 7))} to ${bucketTitle.month(state.dTo.slice(0, 7))}`) : `${niceDay(state.dFrom)} to ${niceDay(state.dTo)}`;
@@ -293,21 +355,26 @@ function drawInsights(el) {
   const feedNote = starts.length && state.dFrom <= starts.at(-1)[1]
     ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${niceDay(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier periods campaign-level CPL and CPA read lower, and ROAS higher, than they really were. Level 1 and channel figures are unaffected.</p>` : '';
   const dayNote = wholeMonths && state.grain === 'month' ? '' : `<p class="sub" style="margin:8px 0 0">Note: ad-platform spend and CRM outcomes are shown on the day they happened. Ledger-only spend has no meaningful day, so each month's amount is spread evenly across that month's days; part-month and weekly figures for it are estimates.</p>`;
-  const head = '<tr><th>Channel / Level 1 / Campaign</th><th>Spend</th><th>' + vsName + '</th><th>Var</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th>CPL</th><th>CPA</th><th>Close %</th><th>ROAS</th><th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th><th class="l">Flag</th></tr>';
+  // Any heading sorts the table: channels, the Level 1s inside each channel and the campaigns inside each Level 1 all follow it.
+  const PS = state.perfSort, pcols = [['name', 'Channel / Level 1 / Campaign'], ['actual', 'Spend'], ['budget', vsName], ['var', 'Var'], ['leads', 'Leads'], ['appts', 'Appts'], ['sales', 'Sales'], ['bookings', 'Bookings $'], ['cpl', 'CPL'], ['cpa', 'CPA'], ['close', 'Close %'], ['roas', 'ROAS'], ['mcob', 'MCOB']];
+  const head = '<tr>' + pcols.map(([k, n]) => `<th class="sortable" data-psort="${k}" title="${k === 'mcob' ? 'Marketing cost of bookings: spend as a share of bookings. ' : ''}Sort by ${n}">${n}${sortMark(PS, k)}</th>`).join('') + '<th class="l">Flag</th></tr>';
+  const pget = { name: (x) => x.name.toLowerCase(), actual: (x) => x.t.actual, budget: (x) => x.t.budget || null, var: (x) => (x.t.budget ? x.t.actual / x.t.budget - 1 : null), leads: (x) => x.t.leads, appts: (x) => x.t.appts, sales: (x) => x.t.sales, bookings: (x) => x.t.bookings,
+    cpl: (x) => (x.t.actual > 0 && x.t.leads > 0 ? x.t.actual / x.t.leads : null), cpa: (x) => (x.t.actual > 0 && x.t.appts > 0 ? x.t.actual / x.t.appts : null), close: (x) => (x.t.appts > 0.5 ? x.t.sales / x.t.appts : null),
+    roas: (x) => (x.t.actual > 0.5 ? x.t.bookings / x.t.actual : null), mcob: (x) => (x.t.actual > 0 && x.t.bookings > 0.5 ? x.t.actual / x.t.bookings : null) };
   const line = (cls, key, label, t, flag = '') => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td><td>${money(t.actual)}</td><td>${t.budget ? money(t.budget) : '—'}</td>
     <td class="${t.budget && t.actual > t.budget ? 'down' : ''}">${ratio(t.actual - t.budget, t.budget, (x) => (x > 0 ? '+' : '') + pct(x))}</td><td>${int(t.leads)}</td><td>${int(t.appts)}</td><td>${int(t.sales)}</td><td>${money(t.bookings)}</td>
     <td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td>${ratio(t.bookings, t.actual, (x) => x.toFixed(1) + 'x')}</td><td>${t.actual > 0 ? ratio(t.actual, t.bookings, pct) : '—'}</td><td class="l">${flag}</td></tr>`;
   let body = '';
-  meta.channels.forEach((c, ci) => {
-    const inCh = rows.filter((r) => r.c.channel.id === c.id); if (!inCh.length) return;
+  const chRows = sortRows(meta.channels.map((c, ci) => { const inCh = rows.filter((r) => r.c.channel.id === c.id); return { c, ci, inCh, name: c.name, t: Object.assign(inCh.reduce((t, r) => add(t, r.t), zero()), { budget: cmpCh(c.id) }) }; }).filter((x) => x.inCh.length), PS, pget);
+  chRows.forEach(({ c, ci, inCh, t: chT }) => {
     const chOpen = !state.open.has('c' + c.id); // channels start expanded
-    body += line('ch', 'c' + c.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}`, Object.assign(inCh.reduce((t, r) => add(t, r.t), zero()), { budget: cmpCh(c.id) }));
+    body += line('ch', 'c' + c.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}`, chT);
     if (!chOpen) return;
-    for (const l of meta.level1.filter((x) => x.channel_id === c.id)) {
-      const inL = inCh.filter((r) => r.c.level1.id === l.id); if (!inL.length) continue;
+    const l1Rows = sortRows(meta.level1.filter((x) => x.channel_id === c.id).map((l) => { const inL = inCh.filter((r) => r.c.level1.id === l.id); return { l, inL, name: l.name, t: Object.assign(inL.reduce((t, r) => add(t, r.t), zero()), { budget: cmpL1(l) }) }; }).filter((x) => x.inL.length), PS, pget);
+    for (const { l, inL } of l1Rows) {
       const lOpen = state.open.has('l' + l.id), nWeak = inL.filter(weak).length;
       body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, Object.assign(inL.reduce((t, r) => add(t, r.t), zero()), { budget: cmpL1(l) }), nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '');
-      if (lOpen) for (const r of inL.sort((a, b) => b.t.actual - a.t.actual)) {
+      if (lOpen) for (const r of sortRows(inL.sort((a, b) => b.t.actual - a.t.actual), PS && PS.k !== 'budget' && PS.k !== 'var' ? PS : null, { ...pget, name: (x) => x.c.name.toLowerCase() })) {
         // A campaign fed by linked ad-platform campaigns opens to show them: the lowest level of third-party detail.
         const srcKey = r.c.sources ? 's' + r.c.id : '', srcOpen = srcKey && state.open.has(srcKey);
         body += line('cp', srcKey, (srcKey ? (srcOpen ? '▾ ' : '▸ ') : '') + esc(r.c.name) + (state.brand ? '' : ` <span class="muted">· ${brandCode(r.c.brand_id)}</span>`) + (r.c.sources ? ` <span class="chip">${r.c.sources} spend source${r.c.sources > 1 ? 's' : ''}</span>` : ''), r.t, weak(r) ? '<span class="chip warn">⚠ Low return</span> <a href="#projections">Reallocate</a>' : '');
@@ -361,21 +428,22 @@ function drawInsights(el) {
     ${un.leads ? `<div class="banner">${int(un.leads)} leads and ${money(un.bookings)} of bookings in this period sit under CRM campaign names that are not mapped yet. <a href="#mappings">Review mappings</a></div>` : ''}
     ${feedSpend ? `<div class="banner" style="background:var(--wash);border-color:#cfe0f5">${compact(feedLinked)} of ${compact(feedSpend)} ad-platform spend (${pct(feedLinked / feedSpend)}) is linked to a CRM campaign, so those campaigns show their own CPL, CPA and ROAS. The rest meets its outcomes at Level 1 only. <a href="#mappings" id="go-links">Review spend links</a></div>` : ''}
     ${off.length ? `<div class="banner">${off.map((b) => esc(b.name)).join(', ')} ${off.length > 1 ? 'are' : 'is'} not in any loaded ledger. ${off.length > 1 ? 'Their' : 'Its'} spend here is ad-platform feeds only, so anything bought outside those platforms is missing.</div>` : ''}
-    <div class="tiles">${tiles.map(([m, val, d]) => `<div class="tile kpi"><div class="kpi-top"><span class="k">${KPIS[m].name}<span class="help" title="${esc(KPIS[m].help)}">?</span></span><button class="zoom" data-zoom="${m}" title="Break ${KPIS[m].name} down by brand, market location, service offering and customer type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Zoom</button></div><div class="v">${val}</div><div class="d">${d}</div>${py[m]}${spark(m)}</div>`).join('')}</div>
+    <div class="tiles k5">${tiles.map(([m, val, d]) => `<div class="tile kpi"><div class="kpi-top"><span class="k">${KPIS[m].name}<span class="help" title="${esc(KPIS[m].help)}">?</span></span><button class="zoom" data-zoom="${m}" title="Break ${KPIS[m].name} down by brand, market location, service offering and customer type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Zoom</button></div><div class="v">${val}</div><div class="d">${d}</div>${py[m]}${spark(m)}</div>`).join('')}</div>
     ${ins.py ? `<p class="sub" style="margin:-6px 0 14px">VS. PY compares with ${niceDay(ins.pyFrom)} to ${niceDay(ins.pyTo)}. Brands that joined part-way through that period have only part of it to compare against, and spend then came from the ledger alone.</p>` : ''}
     <div class="card">
-      <div class="row" style="justify-content:space-between"><div><h2>${state.chartMode === 'compare' ? `${MEASURES[state.measure]}: actual vs budget vs projection, by month` : `${MEASURES[state.measure]} by channel, by ${state.grain}`}</h2><p class="sub" style="margin:0">${rangeText}. ${state.grain === 'day' ? 'Days are drawn as a line per channel. Click a day to focus on it; double-click a line' : 'Click a bar to zoom into it; double-click a colour'}, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
-      <div class="seg" aria-label="Chart type"><button data-cmode="channel" class="${state.chartMode === 'channel' ? 'on' : ''}">${MEASURES[state.measure]} by channel</button><button data-cmode="compare" class="${state.chartMode === 'compare' ? 'on' : ''}">${MEASURES[state.measure]} comparison</button></div>
+      <div class="row" style="justify-content:space-between"><div><h2>${state.chartMode === 'budget' ? `${CHART_MEASURES[state.measure]} by channel vs budget, by month · ${state.year}` : state.chartMode === 'py' ? `${CHART_MEASURES[state.measure]} by channel vs prior year, by ${state.grain}` : `${CHART_MEASURES[state.measure]} by channel, by ${state.grain}`}</h2><p class="sub" style="margin:0">${state.chartMode === 'budget' ? `All of ${state.year}` : rangeText}. ${state.chartMode === 'budget' ? 'One chart per channel: actuals in the channel\'s colour, the budget as loaded as the dashed line. The figures above each chart are for the closed months. Each chart has its own scale. Double-click a chart' : state.chartMode === 'py' ? 'One chart per channel: this year in the channel\'s colour, the same period last year as the dashed line. Each chart has its own scale. Double-click a chart' : RATIO_OF[state.measure] ? 'A ratio cannot be stacked, so each channel is a line and the heavy line is all channels together. Double-click a line' : state.grain === 'day' ? 'Days are drawn as a line per channel. Click a day to focus on it; double-click a line' : 'Click a bar to zoom into it; double-click a colour'}, or a channel in the legend, to open its Level 1 breakdown. A single click on a legend entry hides or shows it.</p></div>
+      <div class="seg" aria-label="Chart type"><button data-cmode="channel" class="${state.chartMode === 'channel' ? 'on' : ''}">By channel</button><button data-cmode="py" class="${state.chartMode === 'py' ? 'on' : ''}" title="Each channel against the same period last year">Channel vs prior year</button><button data-cmode="budget" class="${state.chartMode === 'budget' ? 'on' : ''}" title="Each channel against its budget, month by month">Channel vs budget</button></div>
       </div>
-      <div class="row chart-ctl"><div class="row"><span class="ctl-l">Stage</span><div class="seg pills" aria-label="Measure">${Object.entries(MEASURES).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div></div>
-      <div class="row"><span class="ctl-l">View by</span><div class="seg upper" aria-label="Chart interval">${Object.entries(GRAINS).map(([k, n]) => `<button data-grain="${k}" class="${k === state.grain ? 'on' : ''}">${n}</button>`).join('')}</div></div></div>
-      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${ins.pySeries && state.grain !== 'day' && state.chartMode !== 'compare' ? '<span class="lg-py"><i></i>Same period last year</span>' : ''}</div>
+      <div class="row chart-ctl"><div class="row"><span class="ctl-l">Stage</span><div class="seg pills" aria-label="Measure">${Object.entries(MEASURES).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div>
+        <span class="ctl-l" style="margin-left:10px">Ratio</span><div class="seg pills" aria-label="Ratio">${Object.entries(RATIO_NAMES).map(([k, n]) => `<button data-measure="${k}" class="${k === state.measure ? 'on' : ''}" title="${esc(KPIS[k].name)}">${n}</button>`).join('')}</div></div>
+      <div class="row" ${state.chartMode === 'budget' ? 'style="visibility:hidden"' : ''}><span class="ctl-l">View by</span><div class="seg upper" aria-label="Chart interval">${Object.entries(GRAINS).map(([k, n]) => `<button data-grain="${k}" class="${k === state.grain ? 'on' : ''}">${n}</button>`).join('')}</div></div></div>
+      <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${state.chartMode === 'budget' ? '<span class="lg-py"><i></i>Budget</span>' : ins.pySeries && (state.grain !== 'day' || state.chartMode === 'py') ? '<span class="lg-py"><i></i>Same period last year</span>' : ''}</div>
       <div class="chart" id="chart"></div>${dayNote}
     </div>
     ${reconCard()}
     <div class="card"><div class="row" style="justify-content:space-between"><h2>Channel and Level 1 performance</h2>
       <div class="row"><span class="ctl-l">Spend against</span><div class="seg upper"><button data-vs="budget" class="${vsPlan ? '' : 'on'}">Budget</button><button data-vs="plan" class="${vsPlan ? 'on' : ''}">Projection</button></div><button id="perf-export" title="Every channel, Level 1 and campaign row for this period, as a CSV file that opens in Excel">Export CSV</button></div></div>
-      <p class="sub">${rangeText}. ${vsPlan ? 'The Projection column is the current plan for these dates: hand-entered projections where they exist, otherwise the budget. Level 1 projections follow their channel.' : 'The Budget column is the budget as loaded, by channel and Level 1.'} Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
+      <p class="sub">${rangeText}. ${vsPlan ? 'The Projection column is the current plan for these dates: hand-entered projections where they exist, otherwise the budget. Level 1 projections follow their channel.' : 'The Budget column is the budget as loaded, by channel and Level 1.'} Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand, or a column heading to sort by it. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
       <div class="scroll"><table>${head}${body}</table></div>${feedNote}</div>`;
 
   const chIndex = new Map(meta.channels.map((c, i) => [c.id, i]));
@@ -383,21 +451,21 @@ function drawInsights(el) {
   const g = state.grain, reload = () => insights(el);
   const setRange = (a, b, keepPrev) => { if (!keepPrev) state.prevRange = null; state.dFrom = a; state.dTo = b > through ? through : b; if (state.dFrom > state.dTo) state.dFrom = state.dTo; reload(); };
   // Prior-year totals for the same intervals, drawn as a dashed line. Days are lines per channel, so no total is overlaid there.
-  const pyLine = ins.pySeries && g !== 'day' ? (() => {
-    const idx = new Map(ins.pySeries.buckets.map((k, i) => [k, i])), vals = ins.pySeries.buckets.map(() => 0);
-    for (const r of ins.pySeries.rows) if (r.key != null && !state.hiddenCh.has(r.key)) vals[idx.get(r.bucket)] += r[state.measure] || 0;
-    return ins.series.buckets.map((_, i) => (i < vals.length ? vals[i] : null));
-  })() : null;
+  const isRatio = !!RATIO_OF[state.measure], visible = (id) => !state.hiddenCh.has(id);
+  const pyLine = ins.pySeries && g !== 'day' ? (() => { const vals = seriesTotal(ins.pySeries, state.measure, visible); return ins.series.buckets.map((_, i) => (i < vals.length ? vals[i] : null)); })() : null;
+  // A ratio is drawn as a line per channel, with all channels together as the heavy line.
+  if (isRatio) series.push({ id: 'all', name: 'All channels', color: 'var(--ink)', bold: true, values: seriesTotal(ins.series, state.measure, visible) });
   stackedChart($('#chart'), {
-    buckets: ins.series.buckets, series, fmt: state.measure === 'spend' || state.measure === 'bookings' ? compact : int,
-    line: g === 'day', compare: pyLine, compareName: 'Same period last year',
+    buckets: ins.series.buckets, series, fmt: mfmt(state.measure), noTotal: isRatio,
+    line: g === 'day' || isRatio, compare: pyLine, compareName: isRatio ? 'All channels, same period last year' : 'Same period last year',
     label: bucketLabel[g], title: bucketTitle[g], hint: g === 'day' ? 'Click to focus this day · double-click a colour to break it down' : 'Click to zoom in · double-click a colour to break it down',
     // Zooming remembers where you came from, and steps the interval down so there is something to see.
     onBucket: (k) => { state.prevRange ||= { from: state.dFrom, to: state.dTo, grain: state.grain }; const [a, b] = bucketSpan[g](k); if (g !== 'day') state.grain = 'day'; setRange(a < meta.months[0] + '-01' ? meta.months[0] + '-01' : a, b, true); },
-    onSeries: (id) => openDrill([{ group: 'level1', id, name: ch[id]?.name }]),
+    onSeries: (id) => id !== 'all' && openDrill([{ group: 'level1', id, name: ch[id]?.name }]),
   });
-  // The comparison view replaces the channel chart: the whole of the selected year, month by month.
-  if (state.chartMode === 'compare') compareChart($('#chart'));
+  // The budget view replaces the channel chart: the whole of the selected year, month by month.
+  if (state.chartMode === 'budget') budgetCharts($('#chart'));
+  if (state.chartMode === 'py') pyCharts($('#chart'), el);
   $$('[data-cmode]', el).forEach((b) => (b.onclick = () => { state.chartMode = b.dataset.cmode; insights(el); }));
   let lgTimer;
   $$('[data-lg]', el).forEach((b) => {
@@ -420,6 +488,7 @@ function drawInsights(el) {
   $$('[data-vs]', el).forEach((b) => (b.onclick = () => { state.vsMode = b.dataset.vs; drawInsights(el); }));
   $$('[data-zoom]', el).forEach((b) => (b.onclick = () => openZoom(b.dataset.zoom)));
   $('#perf-export', el).onclick = exportTable;
+  $$('[data-psort]', el).forEach((th) => (th.onclick = () => { state.perfSort = nextSort(state.perfSort, th.dataset.psort, true); drawInsights(el); }));
   $$('tr[data-key]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); drawInsights(el); }));
 }
 
@@ -437,18 +506,19 @@ async function openDrill(path) {
   const l1 = Object.fromEntries(meta.level1.map((l) => [l.id, l.name])), nameOf = (id) => (byCampaign ? data.names?.[id] : l1[id]) || 'Unknown';
   const draw = () => {
     // The eight largest get their own colour; the rest fold into "Other" so the chart stays readable.
-    const all = pivot(data, state.measure, nameOf, () => '').sort((a, b) => b.total[state.measure] - a.total[state.measure]);
+    const DM = RATIO_OF[state.measure] ? 'spend' : state.measure; // the breakdown stacks, so a ratio falls back to spend
+    const all = pivot(data, DM, nameOf, () => '').sort((a, b) => b.total[DM] - a.total[DM]);
     const top = all.slice(0, 8).map((s, i) => ({ ...s, color: COLORS[i] })), rest = all.slice(8);
     const chart = rest.length ? [...top, { id: 'other', name: `Other (${rest.length})`, color: COLORS[8], values: data.buckets.map((_, i) => rest.reduce((a, s) => a + s.values[i], 0)) }] : top;
-    const colour = new Map(top.map((s) => [s.id, s.color])), fmt = state.measure === 'spend' || state.measure === 'bookings' ? compact : int;
+    const colour = new Map(top.map((s) => [s.id, s.color])), fmt = mfmt(DM);
     const T = all.reduce((t, s) => { for (const k in t) t[k] += s.total[k]; return t; }, { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
     const row = (s, cls = '') => `<tr class="${cls}" ${cls || byCampaign ? '' : `data-drill="${s.id}" title="Double-click to see its campaigns"`}><td><i class="dot" style="background:${colour.get(s.id) || COLORS[8]}"></i>${esc(s.name)}</td><td>${money(s.total.spend)}</td><td>${int(s.total.leads)}</td><td>${int(s.total.appts)}</td><td>${int(s.total.sales)}</td><td>${money(s.total.bookings)}</td><td>${cost(s.total.spend, s.total.leads)}</td><td>${cost(s.total.spend, s.total.appts)}</td><td>${ratio(s.total.bookings, s.total.spend, (x) => x.toFixed(1) + 'x')}</td></tr>`;
     dlg.innerHTML = `
       <div class="row" style="justify-content:space-between;align-items:flex-start">
         <div><p class="sub" style="margin:0">${path.map((p, i) => (i < path.length - 1 ? `<button class="link" data-crumb="${i}">${esc(p.name)}</button> › ` : `<b>${esc(p.name)}</b>`)).join('')}</p>
-          <h2 style="margin-top:4px">${MEASURES[state.measure]} by ${byCampaign ? 'campaign' : 'Level 1'}, by ${state.grain}</h2>
+          <h2 style="margin-top:4px">${MEASURES[DM]} by ${byCampaign ? 'campaign' : 'Level 1'}, by ${state.grain}</h2>
           <p class="sub" style="margin:0">${niceDay(state.dFrom)} to ${niceDay(state.dTo)}. ${byCampaign ? 'This is the lowest level of detail. Linked ad-platform spend sits on its CRM campaign.' : 'Double-click a colour, a legend entry or a table row to see its campaigns.'}</p></div>
-        <div class="row"><div class="seg">${Object.entries(MEASURES).map(([k, n]) => `<button data-dmeasure="${k}" class="${k === state.measure ? 'on' : ''}">${n}</button>`).join('')}</div><button id="d-close" aria-label="Close">Close ✕</button></div>
+        <div class="row"><div class="seg">${Object.entries(MEASURES).map(([k, n]) => `<button data-dmeasure="${k}" class="${k === DM ? 'on' : ''}">${n}</button>`).join('')}</div><button id="d-close" aria-label="Close">Close ✕</button></div>
       </div>
       <div class="legend">${chart.map((s) => `<button class="lg" ${s.id === 'other' || byCampaign ? 'disabled' : `data-drill="${s.id}"`}><i style="background:${s.color}"></i>${esc(s.name)}</button>`).join('')}</div>
       <div class="chart" id="d-chart"></div>
@@ -473,12 +543,19 @@ const KPIS = {
   appts: { name: 'Appointments', help: 'Qualified leads with an appointment booked in the period, counted on the date the appointment was booked.', fmt: int, of: (r) => r.appts, records: true, additive: true, crm: true },
   sales: { name: 'Sales', help: 'Sold or completed jobs closed in the period. Additional projects on the same sale are not counted.', fmt: int, of: (r) => r.sales, records: true, additive: true, crm: true },
   bookings: { name: 'Bookings $', help: 'Final contract value of every sold or completed project closed in the period, including additional projects.', fmt: (v) => money(v), of: (r) => r.bookings, records: true, additive: true, crm: true },
-  roas: { name: 'ROAS', help: 'Bookings $ divided by spend. MCOB is the same relationship the other way round: spend as a share of bookings.', fmt: (v) => (v == null ? '—' : v.toFixed(1) + 'x'), of: (r) => (r.spend > 0.5 ? r.bookings / r.spend : null), records: false, additive: false, crm: false },
+  mcob: { name: 'MCOB', help: 'Marketing cost of bookings: spend as a share of Bookings $. Lower is better. ROAS is the same relationship the other way round.', fmt: (v) => (v == null ? '—' : pct(v)), of: (r) => ratioOf(r, 'mcob'), records: false, additive: false, crm: false, lowGood: true },
+  cpl: { name: 'Cost per lead', help: 'Spend divided by new leads created in the period. Lower is better.', fmt: (v) => (v == null ? '—' : money(v)), of: (r) => ratioOf(r, 'cpl'), records: false, additive: false, crm: false, lowGood: true },
+  cpa: { name: 'Cost per appointment', help: 'Spend divided by qualified appointments booked in the period. Lower is better.', fmt: (v) => (v == null ? '—' : money(v)), of: (r) => ratioOf(r, 'cpa'), records: false, additive: false, crm: false, lowGood: true },
+  close: { name: 'Closing rate', help: 'Sales as a share of appointments in the period.', fmt: (v) => (v == null ? '—' : pct(v)), of: (r) => ratioOf(r, 'close'), records: false, additive: false, crm: true },
+  conv: { name: 'Conversion rate', help: 'Appointments as a share of leads in the period.', fmt: (v) => (v == null ? '—' : pct(v)), of: (r) => ratioOf(r, 'conv'), records: false, additive: false, crm: true },
 };
+// The ratio cards: what is divided by what.
+const RATIO_OF = { mcob: ['spend', 'bookings'], cpl: ['spend', 'leads'], cpa: ['spend', 'appts'], close: ['sales', 'appts'], conv: ['appts', 'leads'] };
+const ratioOf = (r, m) => (r[RATIO_OF[m][0]] != null && r[RATIO_OF[m][1]] > 0.5 ? r[RATIO_OF[m][0]] / r[RATIO_OF[m][1]] : null);
 const ZOOM_FILTERS = { brand: 'Brand', location: 'Market location', service: 'Service offering', ctype: 'Customer type' };
 let zoom = null;
 function openZoom(measure) {
-  zoom = { measure, tab: KPIS[measure].crm ? 'overview' : 'brand', f: {}, view: 'breakdown', open: new Set(), cache: {} };
+  zoom = { measure, tab: KPIS[measure].crm ? 'overview' : 'brand', f: {}, view: 'breakdown', open: new Set(), cache: {}, sortO: { k: 'v', dir: -1 }, sortB: { k: 'v', dir: -1 } };
   drawZoom();
 }
 // The Zoom window, laid out like the BI portal's: an Overview with service offering and customer type side by side,
@@ -507,6 +584,7 @@ async function drawZoom() {
     if ($('#z-rec', dlg)) $('#z-rec', dlg).onclick = () => { zoom.view = 'records'; drawZoom(); };
     $$('[data-unf]', dlg).forEach((b) => (b.onclick = () => { delete zoom.f[b.dataset.unf]; drawZoom(); }));
     $$('[data-ztab]', dlg).forEach((b) => (b.onclick = () => { zoom.tab = b.dataset.ztab; zoom.view = 'breakdown'; drawZoom(); }));
+    $$('[data-zsort]', dlg).forEach((th) => (th.onclick = () => { const [w, key] = th.dataset.zsort.split(':'); zoom[w] = nextSort(zoom[w], key); drawZoom(); }));
   };
   const fail = (e) => { dlg.innerHTML = head + `<p>${esc(e.message)}</p>`; wire(); };
 
@@ -529,9 +607,10 @@ async function drawZoom() {
   const vsPy = (now, before) => {
     if (!hasPy || now == null || before == null || !(Math.abs(before) > 1e-9)) return '<span class="muted">—</span>';
     const d = now / before - 1, up = d >= 0;
-    return `<span class="zpy ${zoom.measure === 'spend' ? 'flat' : up ? 'up' : 'down'}">${up ? '▲ +' : '▼ −'}${(Math.abs(d) * 100).toFixed(1)}%</span>`;
+    return `<span class="zpy ${zoom.measure === 'spend' ? 'flat' : up !== !!k.lowGood ? 'up' : 'down'}">${up ? '▲ +' : '▼ −'}${(Math.abs(d) * 100).toFixed(1)}%</span>`;
   };
   const val = (v) => (v == null ? '—' : k.fmt(v));
+  const zth = (which, key, label, attrs = '') => `<th class="sortable" data-zsort="${which}:${key}" ${attrs}>${label}${sortMark(zoom[which], key)}</th>`;
   const banner = (label, now, before) => `<div class="zbanner"><span>${label}</span><span><b>${val(now)}</b>${hasPy ? `${vsPy(now, before)} <small>vs PY</small>` : ''}</span></div>`;
   const tabs = (overviewOff) => `<div class="ztabs" role="tablist"><button data-ztab="overview" class="${zoom.tab === 'overview' ? 'on' : ''}" ${overviewOff ? `disabled title="${esc(overviewOff)}"` : ''}>Overview</button><button data-ztab="brand" class="${zoom.tab === 'brand' ? 'on' : ''}">By Brand &amp; Market</button></div>`;
   const noOverview = !k.crm ? 'Service offering and customer type are recorded on CRM records only, so they are not available for spend-based measures' : zoom.noRecords ? 'Needs CRM records, which the demo data does not have' : '';
@@ -542,15 +621,15 @@ async function drawZoom() {
     if (!D[0].hasRecords) { zoom.noRecords = true; zoom.tab = 'brand'; return drawZoom(); }
     const panel = (dim, title, d, p) => {
       const before = new Map((p?.rows || []).map((r) => [r.key ?? '', k.of(r)]));
-      const rows = d.rows.filter(live).map((r) => ({ ...r, key: r.key ?? '', v: k.of(r) })).filter((r) => r.v).sort((a, b) => (b.v ?? -1) - (a.v ?? -1));
+      const rows = sortRows(d.rows.filter(live).map((r) => ({ ...r, key: r.key ?? '', v: k.of(r) })).filter((r) => r.v), zoom.sortO, { name: (r) => (r.key || '~').toLowerCase(), v: (r) => r.v, py: (r) => changeOn(r.v, before.get(r.key)) });
       const sel = f[dim]?.key, picked = sel != null ? rows.filter((r) => r.key === sel) : rows;
       const total = k.of(sumOf(picked, true)), totalPy = p ? k.of(sumOf(sel != null ? p.rows.filter((r) => (r.key ?? '') === sel) : p.rows, true)) : null;
       return `<div><p class="zcap">By ${title}</p>${banner(sel != null ? esc(f[dim].label) : 'Total', total, totalPy)}
-        <div class="scroll" style="max-height:48vh;overflow-y:auto;margin-top:6px"><table class="ztable"><tr><th>Name</th><th>Actual ▼</th>${hasPy ? '<th>vs PY</th>' : ''}</tr>
+        <div class="scroll" style="max-height:48vh;overflow-y:auto;margin-top:6px"><table class="ztable"><tr>${zth('sortO', 'name', 'Name')}${zth('sortO', 'v', 'Actual')}${hasPy ? zth('sortO', 'py', 'vs PY') : ''}</tr>
         ${rows.map((r) => `<tr class="${r.key ? 'zrow' : ''} ${sel == null ? '' : r.key === sel ? 'sel' : 'dim'}" ${r.key ? `data-zpick="${dim}" data-key="${esc(r.key)}" title="${r.key === sel ? 'Remove this filter' : `Filter everything to ${esc(r.key)}`}"` : ''}><td>${esc(r.key || '(Unspecified)')}</td><td>${val(r.v)}</td>${hasPy ? `<td>${vsPy(r.v, before.get(r.key))}</td>` : ''}</tr>`).join('') || '<tr><td class="muted" colspan="3">Nothing in this period.</td></tr>'}</table></div></div>`;
     };
     dlg.innerHTML = head + tabs() + `<div class="zgrid">${panel('service', 'service offering', D[0], D[2])}${panel('ctype', 'customer type', D[1], D[3])}</div>
-      <p class="sub" style="margin:14px 0 0">Select a row to filter the whole window to it; select it again to clear. Service offering and customer type come from CRM records, so spend, CPA and MCOB are not available at this level.</p>`;
+      <p class="sub" style="margin:14px 0 0">Select a row to filter the whole window to it; select it again to clear. Select a column heading to sort. Service offering and customer type come from CRM records, so spend, CPA and MCOB are not available at this level.</p>`;
     wire();
     $$('[data-zpick]', dlg).forEach((tr) => (tr.onclick = () => { const d = tr.dataset.zpick, key = tr.dataset.key; if (f[d]?.key === key) delete f[d]; else f[d] = { key, label: key }; drawZoom(); }));
     return;
@@ -563,6 +642,8 @@ async function drawZoom() {
   const prep = (d) => d.rows.filter(live).map((r) => ({ ...r, v: k.of(r) })).sort((a, b) => (b.v ?? -1) - (a.v ?? -1));
   const brands = prep(B[0]), locs = prep(B[1]), locBrand = new Map(meta.locations.map((l) => [l.id, l.brand_id]));
   const pyB = new Map((B[2]?.rows || []).map((r) => [r.key, k.of(r)])), pyL = new Map((B[3]?.rows || []).map((r) => [r.key, k.of(r)]));
+  const zget = (py, nameOf) => ({ name: (r) => (nameOf(r.key) || '~').toLowerCase(), v: (r) => r.v, py: (r) => changeOn(r.v, py.get(r.key)), cpa: (r) => (r.spend > 0 && r.appts > 0 ? r.spend / r.appts : null), close: (r) => (r.appts > 0.5 ? r.sales / r.appts : null), mcob: (r) => (r.spend != null && r.bookings > 0.5 ? r.spend / r.bookings : null) });
+  sortRows(brands, zoom.sortB, zget(pyB, brandName)); sortRows(locs, zoom.sortB, zget(pyL, locName));
   const T = sumOf(brands, !withSpend), totalV = k.of(T), totalPy = B[2] ? k.of(sumOf(B[2].rows, !withSpend)) : null;
   const one = brands.length === 1, canFilter = k.crm && B[0].hasRecords;
   const tds = (r, before) => `<td><b>${val(r.v)}</b></td>${hasPy ? `<td>${vsPy(r.v, before)}</td>` : ''}
@@ -577,10 +658,10 @@ async function drawZoom() {
   const nCols = 4 + (hasPy ? 1 : 0) + (k.additive ? 1 : 0) + (withSpend ? 2 : 0);
   dlg.innerHTML = head + tabs(noOverview) + (blocked ? '<p>This measure needs spend, which is not recorded by service offering or customer type. Remove that filter to see it.</p>' : `
     ${banner(`${brands.length === 1 ? esc(brandName(brands[0].key) || '') : `${brands.length} brands`} · total`, totalV, totalPy)}
-    <div class="scroll" style="max-height:50vh;overflow-y:auto;margin-top:6px"><table class="ztable"><tr><th>Brand / market location</th><th>Actual ▼</th>${hasPy ? '<th>vs PY</th>' : ''}${k.additive ? '<th class="l" style="width:18%">Share of total</th>' : ''}
-      ${withSpend ? '<th title="Spend per appointment">CPA</th>' : ''}<th title="Sales as a share of appointments">Closing rate</th>${withSpend ? '<th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th>' : ''}<th></th></tr>
+    <div class="scroll" style="max-height:50vh;overflow-y:auto;margin-top:6px"><table class="ztable"><tr>${zth('sortB', 'name', 'Brand / market location')}${zth('sortB', 'v', 'Actual')}${hasPy ? zth('sortB', 'py', 'vs PY') : ''}${k.additive ? '<th class="l" style="width:18%">Share of total</th>' : ''}
+      ${withSpend ? zth('sortB', 'cpa', 'CPA', 'title="Spend per appointment"') : ''}${zth('sortB', 'close', 'Closing rate', 'title="Sales as a share of appointments"')}${withSpend ? zth('sortB', 'mcob', 'MCOB', 'title="Marketing cost of bookings: spend as a share of bookings"') : ''}<th></th></tr>
       ${body || `<tr><td class="muted" colspan="${nCols}">Nothing in this period for this selection.</td></tr>`}</table></div>
-    <p class="sub" style="margin:14px 0 0">Select a brand to open its market locations.${canFilter ? ' "Overview ›" shows that brand or location by service offering and customer type.' : ''}${withSpend ? '' : ' Spend is not recorded by service offering or customer type, so CPA and MCOB are hidden while that filter is on.'}</p>`);
+    <p class="sub" style="margin:14px 0 0">Select a brand to open its market locations, or a column heading to sort by it.${canFilter ? ' "Overview ›" shows that brand or location by service offering and customer type.' : ''}${withSpend ? '' : ' Spend is not recorded by service offering or customer type, so CPA and MCOB are hidden while that filter is on.'}</p>`);
   wire();
   $$('[data-zopen]', dlg).forEach((tr) => (tr.onclick = () => { const id = Number(tr.dataset.zopen); zoom.open.has(id) ? zoom.open.delete(id) : zoom.open.add(id); drawZoom(); }));
   $$('[data-zf]', dlg).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const [d, id] = b.dataset.zf.split(':'), key = Number(id); if (d === 'location') delete f.brand; else delete f.location; f[d] = { key, label: (d === 'brand' ? brandName(key) : locName(key)) || '' }; zoom.tab = 'overview'; drawZoom(); }));
@@ -642,7 +723,7 @@ async function projections(el) {
 
   el.innerHTML = `
     <div class="row" style="justify-content:space-between;margin-bottom:10px">
-      <div><h1>Maestro <span class="hl">Projections</span> · ${state.year}</h1><p class="sub" style="margin:0">Each open month starts at budget and is adjusted from there, by channel. The channel figure is then shared across the brand's CRM campaigns automatically, or you can set a campaign by hand.</p></div>
+      <div><h1>Maestro <span class="hl">Budget Manager</span> · ${state.year}</h1><p class="sub" style="margin:0">Each open month starts at budget and is adjusted from there, by channel. The channel figure is then shared across the brand's CRM campaigns automatically, or you can set a campaign by hand.</p></div>
       <div class="row"><span class="ctl-l">Projecting</span><div class="seg pills">${Object.entries(PROJ).map(([id, p]) => `<button data-pm="${id}" class="${id === k ? 'on' : ''}">${p.name}</button>`).join('')}</div></div>
     </div>
     ${!has ? `<div class="banner">No ${P.name.toLowerCase()} budget is loaded for ${state.year}, so open months start from the average of the last three closed months instead. Load a budget on the Import screen and they will start from budget.</div>` : ''}
@@ -684,7 +765,7 @@ async function projections(el) {
 }
 
 // ---- move a projection between campaigns --------------------------------------
-// Opens over the Projections screen for the market location in view. The budget is never touched.
+// Opens over the Budget Manager screen for the market location in view. The budget is never touched.
 async function openMove(d) {
   const k = state.pMeasure, P = PROJ[k], fmt = P.money ? money : (v) => (Math.round(v * 10) / 10).toLocaleString('en-US');
   const openMonths = d.months.filter((m) => !closed(m)), loc = meta.locations.find((l) => l.id === d.location);
@@ -743,46 +824,34 @@ async function openMove(d) {
   if (!dlg.open) dlg.showModal();
 }
 
-// ---- actual vs budget vs projection chart ----------------------------------------
-// The same stage as the channel chart, as three bars a month: what happened, the fixed budget, and the current projection.
-function compareChart(host) {
+// ---- channel vs budget chart --------------------------------------------------
+// One small chart per channel for the whole selected year, by month: actuals in the channel's colour and the budget as
+// the dashed line. The budget is the budget as loaded and never changes. It exists for Spend, Appointments and
+// Bookings $, so CPA and MCOB (which are made of those) have a budget too; the other stages and ratios do not.
+function budgetCharts(host) {
   host._ro?.disconnect();
-  const k = state.measure, P = ins.plan;
-  if (!P || !PROJ[k]) { host.innerHTML = '<p class="sub" style="padding:28px 0;margin:0">Budget and projections exist for Spend, Appointments and Bookings $. Pick one of those stages to compare.</p>'; return; }
-  const fmt = PROJ[k].money ? compact : int, months = P.months, chans = P.channels.filter((c) => !state.hiddenCh.has(c.id)), lastData = meta.dataThrough.slice(0, 7);
-  const tot = (f) => months.map((_, i) => chans.reduce((a, c) => a + c.m[k][f][i], 0));
-  const groups = [{ name: 'Actual', color: '#1e3a5f', values: tot('actual').map((v, i) => (months[i] <= lastData ? v : null)) }, { name: 'Budget', color: '#a8b4c4', values: tot('budget') }, { name: 'Projection', color: 'var(--accent)', values: tot('plan') }];
-  const draw = () => {
-    const W = Math.max(300, Math.round(host.clientWidth || 960)), H = Math.round(Math.min(440, Math.max(230, W * 0.34))), L = W < 520 ? 46 : 62, R = 14, T = 16, B = 32, pw = W - L - R, ph = H - T - B;
-    const max = Math.max(1e-9, ...groups.flatMap((g) => g.values.map((v) => v || 0)));
-    const step = (() => { const raw = max / 5, p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 2.5, 5, 10].map((x) => x * p).find((x) => x >= raw); })();
-    const top = Math.ceil((max * 1.04) / step) * step, y = (v) => T + ph - (v / top) * ph, bw = pw / months.length, w = Math.max(2, Math.min(34, (bw * 0.8) / 3 - 2));
-    let svg = `<rect x="${L}" y="${T}" width="${pw}" height="${ph}" fill="none" stroke="var(--grid)"/>`;
-    for (let v = 0; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${v ? 'var(--grid)' : 'var(--axis)'}"/><text class="ax" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`;
-    months.forEach((m, i) => {
-      const x0 = L + bw * i + (bw - (w + 2) * 3 + 2) / 2;
-      if (i) svg += `<line x1="${L + bw * i}" x2="${L + bw * i}" y1="${T}" y2="${T + ph}" stroke="var(--grid)"/>`;
-      groups.forEach((g, gi) => { const v = g.values[i]; if (v == null || v <= 0) return; const h = y(0) - y(v), r = Math.min(3, h, w / 2), x = x0 + gi * (w + 2), yt = y(v); svg += `<path d="M${x},${yt + h}V${yt + r}Q${x},${yt} ${x + r},${yt}H${x + w - r}Q${x + w},${yt} ${x + w},${yt + r}V${yt + h}Z" fill="${g.color}"/>`; });
-      svg += `<text class="ax" x="${L + bw * i + bw / 2}" y="${H - 10}" text-anchor="middle">${bucketLabel.month(m, bw)}${closed(m) ? '' : '*'}</text><rect data-i="${i}" x="${L + bw * i}" y="${T}" width="${bw}" height="${ph}" fill="transparent"/>`;
-    });
-    host.innerHTML = `<div class="legend" style="margin-top:0">${groups.map((g) => `<span class="lg-py"><i style="display:inline-block;width:10px;height:10px;border:0;border-radius:2px;background:${g.color};vertical-align:-1px;margin-right:5px"></i>${g.name}</span>`).join('')}</div>
-      <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Actual, budget and projection by month">${svg}</svg><div class="tip"></div>`;
-    const tip = $('.tip', host), vs = (a, b) => (a == null || !b ? '—' : `${a - b >= 0 ? '+' : '−'}${fmt(Math.abs(a - b))} (${a - b >= 0 ? '+' : '−'}${(Math.abs(a / b - 1) * 100).toFixed(1)}%)`);
-    host.onclick = host.ondblclick = null;
-    host.onmousemove = (e) => {
-      const i = e.target.dataset?.i; if (i == null) return (tip.style.display = 'none');
-      const [a, b, p] = groups.map((g) => g.values[i]);
-      tip.innerHTML = `<b>${bucketTitle.month(months[i])}${closed(months[i]) ? '' : months[i] <= lastData ? ' · month to date' : ' · not started'}</b>` + groups.map((g) => `<div><span><i class="dot" style="background:${g.color}"></i>${g.name}</span><span>${g.values[i] == null ? '—' : fmt(g.values[i])}</span></div>`).join('') +
-        `<div style="margin-top:4px"><span>Actual vs budget</span><span>${vs(a, b)}</span></div><div><span>Actual vs projection</span><span>${vs(a, p)}</span></div>`;
-      const box = host.getBoundingClientRect(); tip.style.display = 'block';
-      tip.style.left = Math.max(0, Math.min(e.clientX - box.left + 14, box.width - tip.offsetWidth - 4)) + 'px'; tip.style.top = Math.max(0, e.clientY - box.top - 20) + 'px';
-    };
-    host.onmouseleave = () => (tip.style.display = 'none');
-    host._w = W;
+  const m = state.measure, rt = RATIO_OF[m], P = ins.plan, parts = rt || [m], fmt = mfmt(m);
+  if (!P || !parts.every((k) => PROJ[k])) { host.innerHTML = '<p class="sub" style="padding:28px 0;margin:0">A budget is loaded for Spend, Appointments and Bookings $, which also gives CPA and MCOB. Pick one of those to compare with budget.</p>'; return; }
+  const months = P.months, lastData = meta.dataThrough.slice(0, 7), shown = (id) => !state.hiddenCh.has(id), colorOf = new Map(meta.channels.map((c, i) => [c.id, COLORS[i]]));
+  // a figure for one month, or for the closed months together, from the channels in a panel
+  const fig = (chans, f, pick) => { const s = (k) => chans.reduce((a, c) => a + c.m[k][f].reduce((x, v, i) => x + (pick(i) ? v || 0 : 0), 0), 0); return rt ? (s(rt[1]) > 0.5 ? s(rt[0]) / s(rt[1]) : null) : s(m); };
+  const panels = [{ id: 'all', name: 'All channels', color: 'var(--ink)', chans: P.channels.filter((c) => shown(c.id)) }, ...P.channels.filter((c) => shown(c.id)).map((c) => ({ id: c.id, name: c.name, color: colorOf.get(c.id) || COLORS[8], chans: [c] }))]
+    .map((p) => ({ ...p, now: fig(p.chans, 'actual', (i) => closed(months[i])), plan: fig(p.chans, 'budget', (i) => closed(months[i])),
+      values: months.map((mo, i) => (mo <= lastData ? fig(p.chans, 'actual', (j) => j === i) : null)), budget: months.map((_, i) => fig(p.chans, 'budget', (j) => j === i)) }))
+    .filter((p) => p.now || p.plan || p.budget.some(Boolean));
+  const chip = (p) => {
+    if (p.now == null || !(Math.abs(p.plan || 0) > 1e-9)) return '<span class="muted">no budget</span>';
+    const d = p.now / p.plan - 1, up = d >= 0, lowGood = m === 'spend' || !!KPIS[m]?.lowGood; // over budget on spend or cost is unfavourable
+    return `<span class="zpy ${up !== lowGood ? 'up' : 'down'}">${up ? '▲ +' : '▼ −'}${(Math.abs(d) * 100).toFixed(1)}%</span>`;
   };
-  draw();
-  host._ro = new ResizeObserver(() => { if (host.isConnected && host.clientWidth > 0 && Math.abs(host.clientWidth - host._w) > 6) draw(); });
-  host._ro.observe(host);
+  const closedM = months.filter(closed), span = closedM.length ? `${mlabel(closedM[0])}–${mlabel(closedM.at(-1))}` : '';
+  host.innerHTML = `<div class="pygrid">${panels.map((p, i) => `<div class="pyp"><div class="pyp-h"><span><i class="dot" style="background:${p.color}"></i><b>${esc(p.name)}</b></span>
+    <span title="Closed months, ${span}">${p.now == null ? '—' : fmt(p.now)} <span class="muted">vs ${p.plan == null ? '—' : fmt(p.plan)}</span> ${chip(p)}</span></div><div class="chart" data-pyc="${i}"></div></div>`).join('') || '<p class="sub" style="padding:28px 0;margin:0">Nothing to show for this selection.</p>'}</div>`;
+  panels.forEach((p, i) => stackedChart($(`[data-pyc="${i}"]`, host), {
+    buckets: months, series: [{ id: p.id, name: 'Actual', color: p.color, values: p.values }], fmt, line: !!rt, noTotal: true, small: true,
+    compare: p.budget.map((v) => v || null), compareName: 'Budget', label: bucketLabel.month, title: bucketTitle.month, hint: p.id === 'all' ? '' : 'Double-click to break it down by Level 1',
+    onSeries: p.id === 'all' ? null : () => openDrill([{ group: 'level1', id: p.id, name: p.name }]),
+  }));
 }
 
 // ---- ledger lines: assign or split one at a time ------------------------------
@@ -837,7 +906,7 @@ async function campaigns(el) {
   const actions = (c) => c.status === 'pending' ? (state.role === 'approver' ? `<button data-decide="approved" data-id="${c.id}" class="primary">Approve</button> <button data-decide="rejected" data-id="${c.id}">Reject</button>` : '<span class="muted">Waiting for approver</span>')
     : c.status === 'approved' ? `<button data-push="${c.id}" class="primary">Push to CRM</button>` : '';
   el.innerHTML = `
-    <h1>Maestro <span class="hl">Campaigns</span></h1><p class="sub">New campaigns start here. A campaign is created in the CRM only after it is approved, so the name is the same everywhere. ${waiting ? `<b>${waiting} waiting for approval.</b>` : ''}</p>
+    <h1>Maestro <span class="hl">Campaign Management</span></h1><p class="sub">New campaigns start here. A campaign is created in the CRM only after it is approved, so the name is the same everywhere. ${waiting ? `<b>${waiting} waiting for approval.</b>` : ''}</p>
     <div class="card"><h2>Request a new campaign</h2><p class="sub">For ${esc(brand.name)}. Change the brand filter above to request for another brand.</p>
       <form id="new"><div class="grid2">
         <label>Level 1 <select name="level1_id">${meta.channels.map((ch) => `<optgroup label="${esc(ch.name)}">${opts(meta.level1.filter((l) => l.channel_id === ch.id))}</optgroup>`).join('')}</select></label>
