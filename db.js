@@ -298,7 +298,7 @@ export function openDb({ reset = false } = {}) {
   if (!db.prepare('PRAGMA table_info(gl_line)').all().some((c) => c.name === 'ext')) db.exec('ALTER TABLE gl_line ADD COLUMN ext TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS gl_line_ext ON gl_line (ext)');
   // month look-ups for the monthly figures that are spread over a month's days
-  db.exec('CREATE INDEX IF NOT EXISTS cal_month ON cal (month, live); CREATE INDEX IF NOT EXISTS spend_month ON spend (month); CREATE INDEX IF NOT EXISTS crm_fact_month ON crm_fact (month)');
+  db.exec('CREATE INDEX IF NOT EXISTS cal_month ON cal (month, live); CREATE INDEX IF NOT EXISTS spend_month ON spend (month); CREATE INDEX IF NOT EXISTS crm_fact_month ON crm_fact (month); CREATE INDEX IF NOT EXISTS crm_name_campaign ON crm_name (campaign_id)');
   // Databases created before spend links existed get the column added in place.
   if (!db.prepare('PRAGMA table_info(campaign)').all().some((c) => c.name === 'linked_to')) db.exec('ALTER TABLE campaign ADD COLUMN linked_to INTEGER');
   return db;

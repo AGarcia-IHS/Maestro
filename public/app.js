@@ -280,11 +280,12 @@ async function insights(el) {
   if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Budget Manager screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
   if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
   const pyFrom = yearBack(state.dFrom), pyTo = yearBack(state.dTo), hasPy = pyFrom >= meta.months[0] + '-01';
-  const [f, range, series, py, pySeries, recon] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
+  const [f, range, series, py, pySeries, recon, pyRange] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
     hasPy ? api(`/api/totals?${scope()}&from=${pyFrom}&to=${pyTo}`) : null,
     hasPy ? api(`/api/series?${scope()}&from=${pyFrom}&to=${pyTo}&grain=${state.grain}&group=channel`) : null,
-    api(`/api/recon?${scope()}&year=${state.year}`)]);
-  facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo, recon };
+    api(`/api/recon?${scope()}&year=${state.year}`),
+    hasPy ? api(`/api/range?${scope()}&from=${pyFrom}&to=${pyTo}`) : null]);
+  facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo, recon, pyRange };
   if (state.chartMode === 'budget') ins.plan = await api(`/api/projections?${scope()}&year=${state.year}`);
   drawInsights(el);
 }
@@ -307,12 +308,33 @@ function drawInsights(el) {
   const budgetOf = (chId) => ins.range.budget.reduce((a, p) => a + (chId == null || p.channel_id === chId ? p.budget : 0), 0);
   tot.budget = budgetOf();
   // The table can set spend against the fixed budget or against the current projection.
-  const vsPlan = state.vsMode === 'plan', vsName = vsPlan ? 'Projection' : 'Budget';
-  const planOf = (chId) => ins.range.plan.reduce((a, p) => a + (chId == null || p.channel_id === chId ? p.plan : 0), 0);
-  const cmpCh = (chId) => (vsPlan ? planOf(chId) : budgetOf(chId));
-  const l1Budget = new Map(ins.range.budgetL1.map((b) => [b.level1_id, b.budget]));
+  const vs = ['budget', 'plan', 'py'].includes(state.vsMode) ? state.vsMode : 'budget', vsName = { budget: 'Budget', plan: 'Projection', py: 'Prior year' }[vs];
+  // Budgets are loaded for spend, appointments and bookings, by Level 1. Projections are held by channel for the same three.
+  const l1B = new Map();
+  for (const b of ins.range.budgetL1) (l1B.get(b.level1_id) || l1B.set(b.level1_id, {}).get(b.level1_id))[b.measure] = b.budget;
+  const chBudget = (chId, k) => (k === 'spend' ? budgetOf(chId) : meta.level1.reduce((a, l) => a + (chId == null || l.channel_id === chId ? l1B.get(l.id)?.[k] || 0 : 0), 0));
+  const chPlan = (chId, k) => ins.range.plan.reduce((a, p) => a + (chId == null || p.channel_id === chId ? p[k === 'spend' ? 'plan' : k] || 0 : 0), 0);
+  // The same period last year, added up the same way as this year: by campaign, with linked ad-platform spend moved to its CRM campaign.
+  const info = new Map(facts.campaigns.map((c) => [c.id, c])), bump = (map, k) => map.get(k) || map.set(k, zero()).get(k);
+  const pyT = new Map(), pyL1 = new Map(), pyCh = new Map(), pyAll = zero(), pyUn = zero();
+  for (const r of ins.pyRange?.rows || []) {
+    const c = r.key == null ? null : info.get(r.key); if (r.key != null && !c) continue;
+    const own = !c || !(c.linked_to && info.has(c.linked_to)), t = !c ? pyUn : bump(pyT, own ? c.id : c.linked_to);
+    t.actual += r.spend; if (own) { t.leads += r.leads; t.appts += r.appts; t.sales += r.sales; t.bookings += r.bookings; }
+  }
+  for (const [id, t] of pyT) { const l = l1[info.get(id).level1_id]; add(bump(pyL1, l.id), t); add(bump(pyCh, l.channel_id), t); add(pyAll, t); }
+  const three = (f) => ({ actual: f('spend'), appts: f('appts'), bookings: f('bookings') });
+  const cmpCh = (chId) => (vs === 'py' ? (!ins.pyRange ? null : chId == null ? add({ ...pyAll }, pyUn) : pyCh.get(chId)) : three((k) => (vs === 'plan' ? chPlan : chBudget)(chId, k)));
   // Projections are held by channel, so a Level 1's projection is its budget scaled by how far its channel has moved from budget.
-  const cmpL1 = (l) => { const b = l1Budget.get(l.id) || 0, chB = budgetOf(l.channel_id); return !vsPlan ? b : chB > 0 ? b * (planOf(l.channel_id) / chB) : 0; };
+  const cmpL1 = (l) => (vs === 'py' ? pyL1.get(l.id) : three((k) => { const b = l1B.get(l.id)?.[k] || 0, chB = chBudget(l.channel_id, k); return vs !== 'plan' ? b : chB > 0 ? b * (chPlan(l.channel_id, k) / chB) : 0; }));
+  const mcOf = (x) => (x && x.actual > 0 && x.bookings > 0.5 ? x.actual / x.bookings : null);
+  // A figure with its variance underneath: the amount, then the percentage. Hovering shows what it is compared with.
+  const sgn = (x, f) => (x >= 0 ? '+' : '−') + f(Math.abs(x));
+  const vcell = (main, now, before, f, good, bf) => {
+    if (before == null || now == null || !(Math.abs(before) > 1e-9)) return `<td>${main}</td>`;
+    const d = now - before, cls = good === 'flat' || Math.abs(d) < 1e-9 ? 'flat' : d > 0 === (good === 'up') ? 'up' : 'down';
+    return `<td title="${vsName} ${bf(before)}">${main}<div class="vr ${cls}">${sgn(d, f)} · ${sgn(d / Math.abs(before), pct)}</div></td>`;
+  };
   const blended = tot.actual ? tot.bookings / tot.actual : 0;
   const weak = (r) => !r.c.source.startsWith('gl_') && r.t.leads > 0 && r.t.actual > tot.actual * 0.01 && r.t.bookings / r.t.actual < blended * 0.5;
   const v = tot.budget ? tot.actual / tot.budget - 1 : 0;
@@ -353,58 +375,63 @@ function drawInsights(el) {
   // Footnote: third-party campaign detail only exists from the day each platform feed was switched on.
   const starts = Object.entries(meta.feedStart || {}).sort((a, b) => a[1].localeCompare(b[1]));
   const feedNote = starts.length && state.dFrom <= starts.at(-1)[1]
-    ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${niceDay(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier periods campaign-level CPL and CPA read lower, and ROAS higher, than they really were. Level 1 and channel figures are unaffected.</p>` : '';
+    ? `<p class="sub" style="margin:12px 0 0">Note: ad-platform campaign detail begins when each feed was switched on (${starts.map(([p, d]) => `${PLATFORM_NAME[p] || p} ${niceDay(d)}`).join(', ')}) and cannot be backfilled. Before those dates, spend for those platforms comes from the ledger only and shows as "Other GL spend" with no campaign names, so for earlier periods campaign-level CPL, CPA and MCOB read lower than they really were. Level 1 and channel figures are unaffected.</p>` : '';
   const dayNote = wholeMonths && state.grain === 'month' ? '' : `<p class="sub" style="margin:8px 0 0">Note: ad-platform spend and CRM outcomes are shown on the day they happened. Ledger-only spend has no meaningful day, so each month's amount is spread evenly across that month's days; part-month and weekly figures for it are estimates.</p>`;
   // Any heading sorts the table: channels, the Level 1s inside each channel and the campaigns inside each Level 1 all follow it.
-  const PS = state.perfSort, pcols = [['name', 'Channel / Level 1 / Campaign'], ['actual', 'Spend'], ['budget', vsName], ['var', 'Var'], ['leads', 'Leads'], ['appts', 'Appts'], ['sales', 'Sales'], ['bookings', 'Bookings $'], ['cpl', 'CPL'], ['cpa', 'CPA'], ['close', 'Close %'], ['roas', 'ROAS'], ['mcob', 'MCOB']];
+  const PS = state.perfSort, pcols = [['name', 'Channel / Level 1 / Campaign'], ['actual', 'Spend'], ['leads', 'Leads'], ['appts', 'Appts'], ['sales', 'Sales'], ['bookings', 'Bookings $'], ['mcob', 'MCOB'], ['cpl', 'CPL'], ['cpa', 'CPA'], ['close', 'Close %']];
   const head = '<tr>' + pcols.map(([k, n]) => `<th class="sortable" data-psort="${k}" title="${k === 'mcob' ? 'Marketing cost of bookings: spend as a share of bookings. ' : ''}Sort by ${n}">${n}${sortMark(PS, k)}</th>`).join('') + '<th class="l">Flag</th></tr>';
-  const pget = { name: (x) => x.name.toLowerCase(), actual: (x) => x.t.actual, budget: (x) => x.t.budget || null, var: (x) => (x.t.budget ? x.t.actual / x.t.budget - 1 : null), leads: (x) => x.t.leads, appts: (x) => x.t.appts, sales: (x) => x.t.sales, bookings: (x) => x.t.bookings,
+  const pget = { name: (x) => x.name.toLowerCase(), actual: (x) => x.t.actual, leads: (x) => x.t.leads, appts: (x) => x.t.appts, sales: (x) => x.t.sales, bookings: (x) => x.t.bookings,
     cpl: (x) => (x.t.actual > 0 && x.t.leads > 0 ? x.t.actual / x.t.leads : null), cpa: (x) => (x.t.actual > 0 && x.t.appts > 0 ? x.t.actual / x.t.appts : null), close: (x) => (x.t.appts > 0.5 ? x.t.sales / x.t.appts : null),
-    roas: (x) => (x.t.actual > 0.5 ? x.t.bookings / x.t.actual : null), mcob: (x) => (x.t.actual > 0 && x.t.bookings > 0.5 ? x.t.actual / x.t.bookings : null) };
-  const line = (cls, key, label, t, flag = '') => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td><td>${money(t.actual)}</td><td>${t.budget ? money(t.budget) : '—'}</td>
-    <td class="${t.budget && t.actual > t.budget ? 'down' : ''}">${ratio(t.actual - t.budget, t.budget, (x) => (x > 0 ? '+' : '') + pct(x))}</td><td>${int(t.leads)}</td><td>${int(t.appts)}</td><td>${int(t.sales)}</td><td>${money(t.bookings)}</td>
-    <td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td>${ratio(t.bookings, t.actual, (x) => x.toFixed(1) + 'x')}</td><td>${t.actual > 0 ? ratio(t.actual, t.bookings, pct) : '—'}</td><td class="l">${flag}</td></tr>`;
+    mcob: (x) => mcOf(x.t) };
+  const ptsF = (x) => (x * 100).toFixed(1) + ' pts';
+  // Over budget on spend, or a higher MCOB, is unfavourable. Spend against last year is neither good nor bad on its own.
+  const line = (cls, key, label, t, flag = '', c = null) => `<tr class="${cls}" ${key ? `data-key="${key}"` : ''}><td>${label}</td>
+    ${vcell(money(t.actual), t.actual, c?.actual, compact, vs === 'py' ? 'flat' : 'down', money)}${vcell(int(t.leads), t.leads, c?.leads, int, 'up', int)}${vcell(int(t.appts), t.appts, c?.appts, int, 'up', int)}${vcell(int(t.sales), t.sales, c?.sales, int, 'up', int)}${vcell(money(t.bookings), t.bookings, c?.bookings, compact, 'up', money)}
+    ${vcell(t.actual > 0 ? ratio(t.actual, t.bookings, pct) : '—', mcOf(t), mcOf(c), ptsF, 'down', pct)}<td>${cost(t.actual, t.leads)}</td><td>${cost(t.actual, t.appts)}</td><td>${ratio(t.sales, t.appts, pct)}</td><td class="l">${flag}</td></tr>`;
   let body = '';
-  const chRows = sortRows(meta.channels.map((c, ci) => { const inCh = rows.filter((r) => r.c.channel.id === c.id); return { c, ci, inCh, name: c.name, t: Object.assign(inCh.reduce((t, r) => add(t, r.t), zero()), { budget: cmpCh(c.id) }) }; }).filter((x) => x.inCh.length), PS, pget);
+  const chRows = sortRows(meta.channels.map((c, ci) => { const inCh = rows.filter((r) => r.c.channel.id === c.id); return { c, ci, inCh, name: c.name, t: inCh.reduce((t, r) => add(t, r.t), zero()) }; }).filter((x) => x.inCh.length), PS, pget);
   chRows.forEach(({ c, ci, inCh, t: chT }) => {
     const chOpen = !state.open.has('c' + c.id); // channels start expanded
-    body += line('ch', 'c' + c.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}`, chT);
+    body += line('ch', 'c' + c.id, `${chOpen ? '▾' : '▸'} <i class="dot" style="background:${COLORS[ci]}"></i>${esc(c.name)}`, chT, '', cmpCh(c.id));
     if (!chOpen) return;
-    const l1Rows = sortRows(meta.level1.filter((x) => x.channel_id === c.id).map((l) => { const inL = inCh.filter((r) => r.c.level1.id === l.id); return { l, inL, name: l.name, t: Object.assign(inL.reduce((t, r) => add(t, r.t), zero()), { budget: cmpL1(l) }) }; }).filter((x) => x.inL.length), PS, pget);
-    for (const { l, inL } of l1Rows) {
+    const l1Rows = sortRows(meta.level1.filter((x) => x.channel_id === c.id).map((l) => { const inL = inCh.filter((r) => r.c.level1.id === l.id); return { l, inL, name: l.name, t: inL.reduce((t, r) => add(t, r.t), zero()) }; }).filter((x) => x.inL.length), PS, pget);
+    for (const { l, inL, t: lT } of l1Rows) {
       const lOpen = state.open.has('l' + l.id), nWeak = inL.filter(weak).length;
-      body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, Object.assign(inL.reduce((t, r) => add(t, r.t), zero()), { budget: cmpL1(l) }), nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '');
-      if (lOpen) for (const r of sortRows(inL.sort((a, b) => b.t.actual - a.t.actual), PS && PS.k !== 'budget' && PS.k !== 'var' ? PS : null, { ...pget, name: (x) => x.c.name.toLowerCase() })) {
+      body += line('l1', 'l' + l.id, `${lOpen ? '▾' : '▸'} ${esc(l.name)} <span class="muted">(${inL.length})</span>`, lT, nWeak && !lOpen ? `<span class="chip warn">⚠ ${nWeak} low return</span>` : '', cmpL1(l));
+      if (lOpen) for (const r of sortRows(inL.sort((a, b) => b.t.actual - a.t.actual), PS, { ...pget, name: (x) => x.c.name.toLowerCase() })) {
         // A campaign fed by linked ad-platform campaigns opens to show them: the lowest level of third-party detail.
         const srcKey = r.c.sources ? 's' + r.c.id : '', srcOpen = srcKey && state.open.has(srcKey);
-        body += line('cp', srcKey, (srcKey ? (srcOpen ? '▾ ' : '▸ ') : '') + esc(r.c.name) + (state.brand ? '' : ` <span class="muted">· ${brandCode(r.c.brand_id)}</span>`) + (r.c.sources ? ` <span class="chip">${r.c.sources} spend source${r.c.sources > 1 ? 's' : ''}</span>` : ''), r.t, weak(r) ? '<span class="chip warn">⚠ Low return</span> <a href="#projections">Reallocate</a>' : '');
+        body += line('cp', srcKey, (srcKey ? (srcOpen ? '▾ ' : '▸ ') : '') + esc(r.c.name) + (state.brand ? '' : ` <span class="muted">· ${brandCode(r.c.brand_id)}</span>`) + (r.c.sources ? ` <span class="chip">${r.c.sources} spend source${r.c.sources > 1 ? 's' : ''}</span>` : ''), r.t, weak(r) ? '<span class="chip warn">⚠ Low return</span> <a href="#projections">Reallocate</a>' : '', vs === 'py' ? pyT.get(r.c.id) : null);
         if (srcOpen) {
           const srcs = r.c.sourceList.map((s) => ({ s, spend: s.t.actual })).sort((a, b) => b.spend - a.spend), linked = srcs.reduce((a, x) => a + x.spend, 0);
-          for (const x of srcs) body += `<tr class="src"><td>${esc(x.s.name)} <span class="chip">${PLATFORM_NAME[x.s.source] || esc(x.s.source)}</span></td><td>${money(x.spend)}</td><td colspan="12" class="l muted">${x.spend ? `${pct(linked ? x.spend / linked : 0)} of this campaign's platform spend` : 'No spend in this period'} · ${esc(x.s.level1.name)}</td></tr>`;
-          if (Math.abs(r.t.actual - linked) > 1) body += `<tr class="src"><td class="muted">Spend recorded on the CRM campaign itself</td><td>${money(r.t.actual - linked)}</td><td colspan="12"></td></tr>`;
+          for (const x of srcs) body += `<tr class="src"><td>${esc(x.s.name)} <span class="chip">${PLATFORM_NAME[x.s.source] || esc(x.s.source)}</span></td><td>${money(x.spend)}</td><td colspan="9" class="l muted">${x.spend ? `${pct(linked ? x.spend / linked : 0)} of this campaign's platform spend` : 'No spend in this period'} · ${esc(x.s.level1.name)}</td></tr>`;
+          if (Math.abs(r.t.actual - linked) > 1) body += `<tr class="src"><td class="muted">Spend recorded on the CRM campaign itself</td><td>${money(r.t.actual - linked)}</td><td colspan="9"></td></tr>`;
         }
       }
     }
   });
-  if (un.leads) body += line('l1', '', 'Not mapped to a campaign', un, '<a href="#mappings">Map names</a>');
-  body += line('total', '', 'Total', Object.assign(add({ ...tot }, un), { budget: cmpCh() }));
+  if (un.leads) body += line('l1', '', 'Not mapped to a campaign', un, '<a href="#mappings">Map names</a>', vs === 'py' && ins.pyRange ? pyUn : null);
+  body += line('total', '', 'Total', add({ ...tot }, un), '', cmpCh());
 
   // The export carries every channel, Level 1 and campaign row, whatever is expanded on screen, as plain numbers.
   const exportTable = () => {
     const r2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : ''), div = (a, b) => (b > 0.5 ? a / b : NaN);
-    const out = [['Row', 'Channel', 'Level 1', 'Campaign', 'Brand', `Spend (${state.cur})`, `${vsName} (${state.cur})`, 'Variance %', 'Leads', 'Appointments', 'Sales', `Bookings (${state.cur})`, 'CPL', 'CPA', 'Closing rate %', 'ROAS', 'MCOB %']];
-    const put = (kind, chName, l1Name, camp, brand, t, cmp) => out.push([kind, chName, l1Name, camp, brand, r2(t.actual), cmp == null ? '' : r2(cmp), cmp > 0 ? r2((t.actual / cmp - 1) * 100) : '', Math.round(t.leads), Math.round(t.appts), Math.round(t.sales), r2(t.bookings),
-      r2(t.actual > 0 ? div(t.actual, t.leads) : NaN), r2(t.actual > 0 ? div(t.actual, t.appts) : NaN), r2(div(t.sales, t.appts) * 100), r2(div(t.bookings, t.actual)), r2(t.actual > 0 ? div(t.actual, t.bookings) * 100 : NaN)]);
+    // each of the six compared figures is followed by what it is compared with, the variance and the variance %
+    const M6 = [[`Spend (${state.cur})`, (x) => x.actual], ['Leads', (x) => x.leads], ['Appointments', (x) => x.appts], ['Sales', (x) => x.sales], [`Bookings (${state.cur})`, (x) => x.bookings], ['MCOB %', (x) => { const m = mcOf(x); return m == null ? null : m * 100; }]];
+    const out = [['Row', 'Channel', 'Level 1', 'Campaign', 'Brand', ...M6.flatMap(([n]) => [n, `${n}: ${vsName}`, `${n}: variance`, `${n}: variance %`]), 'CPL', 'CPA', 'Closing rate %']];
+    const put = (kind, chName, l1Name, camp, brand, t, cmp) => out.push([kind, chName, l1Name, camp, brand,
+      ...M6.flatMap(([, f]) => { const a = f(t), b = cmp ? f(cmp) : null, ok = a != null && b != null && Math.abs(b) > 1e-9; return [r2(a), ok ? r2(b) : '', ok ? r2(a - b) : '', ok ? r2((a / Math.abs(b) - Math.sign(b)) * 100) : '']; }),
+      r2(t.actual > 0 ? div(t.actual, t.leads) : NaN), r2(t.actual > 0 ? div(t.actual, t.appts) : NaN), r2(div(t.sales, t.appts) * 100)]);
     for (const c of meta.channels) {
       const inCh = rows.filter((r) => r.c.channel.id === c.id); if (!inCh.length) continue;
       put('Channel', c.name, '', '', '', inCh.reduce((t, r) => add(t, r.t), zero()), cmpCh(c.id));
       for (const l of meta.level1.filter((x) => x.channel_id === c.id)) {
         const inL = inCh.filter((r) => r.c.level1.id === l.id); if (!inL.length) continue;
         put('Level 1', c.name, l.name, '', '', inL.reduce((t, r) => add(t, r.t), zero()), cmpL1(l));
-        for (const r of inL.sort((a, b) => b.t.actual - a.t.actual)) put('Campaign', c.name, l.name, r.c.name, meta.brands.find((b) => b.id === r.c.brand_id)?.name || '', r.t, null);
+        for (const r of inL.sort((a, b) => b.t.actual - a.t.actual)) put('Campaign', c.name, l.name, r.c.name, meta.brands.find((b) => b.id === r.c.brand_id)?.name || '', r.t, vs === 'py' ? pyT.get(r.c.id) : null);
       }
     }
-    if (un.leads) put('Not mapped to a campaign', '', '', '', '', un, null);
+    if (un.leads) put('Not mapped to a campaign', '', '', '', '', un, vs === 'py' && ins.pyRange ? pyUn : null);
     put('Total', '', '', '', '', add({ ...tot }, un), cmpCh());
     const cell = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
     const a = document.createElement('a');
@@ -426,7 +453,7 @@ function drawInsights(el) {
       </div>
     </div>
     ${un.leads ? `<div class="banner">${int(un.leads)} leads and ${money(un.bookings)} of bookings in this period sit under CRM campaign names that are not mapped yet. <a href="#mappings">Review mappings</a></div>` : ''}
-    ${feedSpend ? `<div class="banner" style="background:var(--wash);border-color:#cfe0f5">${compact(feedLinked)} of ${compact(feedSpend)} ad-platform spend (${pct(feedLinked / feedSpend)}) is linked to a CRM campaign, so those campaigns show their own CPL, CPA and ROAS. The rest meets its outcomes at Level 1 only. <a href="#mappings" id="go-links">Review spend links</a></div>` : ''}
+    ${feedSpend ? `<div class="banner" style="background:var(--wash);border-color:#cfe0f5">${compact(feedLinked)} of ${compact(feedSpend)} ad-platform spend (${pct(feedLinked / feedSpend)}) is linked to a CRM campaign, so those campaigns show their own CPL, CPA and MCOB. The rest meets its outcomes at Level 1 only. <a href="#mappings" id="go-links">Review spend links</a></div>` : ''}
     ${off.length ? `<div class="banner">${off.map((b) => esc(b.name)).join(', ')} ${off.length > 1 ? 'are' : 'is'} not in any loaded ledger. ${off.length > 1 ? 'Their' : 'Its'} spend here is ad-platform feeds only, so anything bought outside those platforms is missing.</div>` : ''}
     <div class="tiles k5">${tiles.map(([m, val, d]) => `<div class="tile kpi"><div class="kpi-top"><span class="k">${KPIS[m].name}<span class="help" title="${esc(KPIS[m].help)}">?</span></span><button class="zoom" data-zoom="${m}" title="Break ${KPIS[m].name} down by brand, market location, service offering and customer type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Zoom</button></div><div class="v">${val}</div><div class="d">${d}</div>${py[m]}${spark(m)}</div>`).join('')}</div>
     ${ins.py ? `<p class="sub" style="margin:-6px 0 14px">VS. PY compares with ${niceDay(ins.pyFrom)} to ${niceDay(ins.pyTo)}. Brands that joined part-way through that period have only part of it to compare against, and spend then came from the ledger alone.</p>` : ''}
@@ -442,8 +469,8 @@ function drawInsights(el) {
     </div>
     ${reconCard()}
     <div class="card"><div class="row" style="justify-content:space-between"><h2>Channel and Level 1 performance</h2>
-      <div class="row"><span class="ctl-l">Spend against</span><div class="seg upper"><button data-vs="budget" class="${vsPlan ? '' : 'on'}">Budget</button><button data-vs="plan" class="${vsPlan ? 'on' : ''}">Projection</button></div><button id="perf-export" title="Every channel, Level 1 and campaign row for this period, as a CSV file that opens in Excel">Export CSV</button></div></div>
-      <p class="sub">${rangeText}. ${vsPlan ? 'The Projection column is the current plan for these dates: hand-entered projections where they exist, otherwise the budget. Level 1 projections follow their channel.' : 'The Budget column is the budget as loaded, by channel and Level 1.'} Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand, or a column heading to sort by it. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
+      <div class="row"><span class="ctl-l">Variance vs</span><div class="seg upper">${[['budget', 'Budget'], ['plan', 'Projection'], ['py', 'Prior year']].map(([k, n]) => `<button data-vs="${k}" class="${vs === k ? 'on' : ''}">${n}</button>`).join('')}</div><button id="perf-export" title="Every channel, Level 1 and campaign row for this period, as a CSV file that opens in Excel">Export CSV</button></div></div>
+      <p class="sub">${rangeText}. The small line under a figure is its variance to ${vs === 'py' ? `the same period last year (${niceDay(ins.pyFrom)} to ${niceDay(ins.pyTo)})` : `${vsName.toLowerCase()}`}, as an amount and a percentage; hover over it for the ${vsName.toLowerCase()} figure. ${vs === 'py' ? (ins.pyRange ? 'It goes down to campaign level.' : 'There is no prior-year data for this period.') : vs === 'plan' ? 'The projection is the current plan for these dates: hand-entered projections where they exist, otherwise the budget. It covers Spend, Appointments and Bookings $ (so MCOB too), by channel; Level 1 projections follow their channel.' : 'The budget as loaded covers Spend, Appointments and Bookings $ (so MCOB too), by channel and Level 1. There is no Leads or Sales budget.'} Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand, or a column heading to sort by it. A campaign is flagged when its MCOB is more than double the blended ${blended ? pct(1 / blended) : '—'}.</p>
       <div class="scroll"><table>${head}${body}</table></div>${feedNote}</div>`;
 
   const chIndex = new Map(meta.channels.map((c, i) => [c.id, i]));
