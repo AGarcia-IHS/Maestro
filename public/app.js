@@ -494,7 +494,7 @@ async function drawZoom() {
       <p class="sub" style="margin:14px 0 0"><button class="link" id="z-back">‹ Back to the breakdown</button> · ${d.count.toLocaleString()} ${zoom.measure === 'spend' ? 'ledger lines' : 'records'}${d.count > d.shown ? `, showing the first ${d.shown.toLocaleString()}` : ''} · total ${money(d.total)}</p>
       ${zoom.measure === 'spend' ? '<p class="sub" style="margin:6px 0 0">These are the ledger lines for the months in the period, which is the official spend. Ad-platform campaign detail is in the chart drill-down. Brands or months with no ledger loaded have no lines here.</p>' : ''}
       <div class="scroll" style="max-height:56vh;overflow-y:auto;margin-top:10px"><table><tr>${d.cols.map((c) => `<th class="${isMoney(c) ? '' : 'l'}">${esc(c)}</th>`).join('')}</tr>
-        ${d.rows.map((r) => `<tr>${r.map((v, i) => `<td class="${isMoney(d.cols[i]) ? '' : 'l'}">${v == null || v === '' ? '—' : isMoney(d.cols[i]) ? money(v) : esc(v)}</td>`).join('')}</tr>`).join('') || `<tr><td class="l muted" colspan="${d.cols.length}">No records for this selection.</td></tr>`}</table></div>`;
+        ${d.rows.map((r) => `<tr>${r.map((v, i) => `<td class="${isMoney(d.cols[i]) ? '' : /description/i.test(d.cols[i]) ? 'l wrap' : 'l'}" ${/description/i.test(d.cols[i]) ? 'style="min-width:260px"' : ''}>${v == null || v === '' ? '—' : isMoney(d.cols[i]) ? money(v) : esc(v)}</td>`).join('')}</tr>`).join('') || `<tr><td class="l muted" colspan="${d.cols.length}">No records for this selection.</td></tr>`}</table></div>`;
     wire(); $('#z-back', dlg).onclick = () => { zoom.view = 'breakdown'; drawZoom(); };
     return;
   }

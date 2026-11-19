@@ -619,11 +619,17 @@ const routes = {
     let cols, rows, count, total;
     if (query.measure === 'spend') {
       const where = `g.month BETWEEN ? AND ? AND ${inScope('g.brand_id')} ${fl ? `AND g.location_id = ${fl}` : ''}`, args = [query.from.slice(0, 7), query.to.slice(0, 7)];
-      cols = ['Date', 'Period', 'Brand', 'Market location', 'Level 1', 'GL account', 'Vendor', 'Description', 'Reference', 'Ledger', `Amount (${CUR})`];
+      // the journal description and amount come first, so they are readable without scrolling sideways
+      cols = ['Date', 'Brand', 'Market location', 'Level 1', 'Journal description', 'Vendor', `Amount (${CUR})`, 'GL account', 'Reference', 'Period', 'Ledger'];
       ({ n: count, t: total } = q(`SELECT COUNT(*) n, SUM(g.amount * ${fxSql('b')}) t FROM gl_line g JOIN brand b ON b.id = g.brand_id WHERE ${where}`).get(...args));
-      rows = q(`SELECT g.day, g.month, b.name brand, lo.name location, l.name level1, g.account, g.vendor, g.description, g.ref, g.source, ROUND(g.amount * ${fxSql('b')}, 2) amount
+      rows = q(`SELECT g.day, b.name brand, lo.name location, l.name level1, g.description, g.vendor, ROUND(g.amount * ${fxSql('b')}, 2) amount, g.account, g.ref, g.month, g.source
                 FROM gl_line g JOIN brand b ON b.id = g.brand_id JOIN location lo ON lo.id = g.location_id JOIN level1 l ON l.id = g.level1_id
-                WHERE ${where} ORDER BY g.day DESC, g.id LIMIT ${limit}`).all(...args).map((r) => Object.values(r));
+                WHERE ${where} ORDER BY g.day DESC, g.id LIMIT ${limit}`).all(...args).map((r) => {
+        // Acumatica gives "journal description | line description"; when the two are the same, show it once
+        const [a, b, ...rest] = String(r.description || '').split(' | ');
+        if (b != null && !rest.length && a.trim() === b.trim()) r.description = a.trim();
+        return Object.values(r);
+      });
     } else {
       const on = { leads: ['r.lead_day', 'r.clone = 0'], appts: ['r.appt_day', "r.clone = 0 AND r.status <> 'not qualified'"], sales: ['r.closed_day', 'r.clone = 0 AND r.won = 1'], bookings: ['r.closed_day', 'r.won = 1'] }[query.measure];
       need(on, 'Records are available for spend, leads, appointments, sales and bookings');
