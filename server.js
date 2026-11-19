@@ -569,6 +569,21 @@ const routes = {
     return out;
   },
 
+  // ---- spend reconciliation ---------------------------------------------------
+  // One year by month: what the ledger says, what the ad platforms report, and the lines Maestro adds to get from the
+  // platforms to the spend it presents. Returned by brand and Level 1 so any row can be opened up.
+  'GET /api/recon': ({ query }) => {
+    const year = /^\d{4}$/.test(query.year || '') ? query.year : CLOSED_THROUGH.slice(0, 4), loc = num(query.location);
+    const through = getThrough(db).slice(0, 7), months = MONTHS.filter((m) => m.startsWith(year) && m <= through);
+    const KIND = { google_ads: 'platform', bing_ads: 'platform', meta_ads: 'platform', active_prospect: 'platform', gl_assigned: 'assigned', gl_unallocated: 'other', gl_timing: 'timing' };
+    const cells = q(`SELECT g.month, g.brand_id, g.level1_id, 'ledger' kind, SUM(g.amount * ${fxSql('b')}) v FROM gl g JOIN brand b ON b.id = g.brand_id
+                     WHERE g.month BETWEEN ? AND ? AND ${inScope('g.brand_id')} ${loc ? `AND g.location_id = ${loc}` : ''} GROUP BY 1, 2, 3`).all(months[0] || '', months.at(-1) || '');
+    for (const r of q(`SELECT s.month, c.brand_id, c.level1_id, c.source, SUM(s.actual * ${fxSql('b')}) v FROM spend s JOIN campaign c ON c.id = s.campaign_id JOIN brand b ON b.id = c.brand_id
+                       WHERE s.month BETWEEN ? AND ? AND s.actual <> 0 AND ${inScope('c.brand_id')} ${loc ? `AND s.location_id = ${loc}` : ''} GROUP BY 1, 2, 3, 4`).all(months[0] || '', months.at(-1) || ''))
+      cells.push({ month: r.month, brand_id: r.brand_id, level1_id: r.level1_id, kind: KIND[r.source] || 'entered', v: r.v });
+    return { year, months, cells };
+  },
+
   // ---- KPI zoom -------------------------------------------------------------
   // One KPI broken down by brand, market location, service offering or customer type, with optional filters.
   // Brand and location come from the same figures as the rest of Insights and include spend. Service offering and

@@ -182,15 +182,55 @@ function pyChips(now, before, { fmt, goodWhenUp = true, neutral = false, points 
   const diff = now - before, up = diff >= 0, cls = neutral ? 'flat' : up === goodWhenUp ? 'good' : 'bad';
   return `<div class="py"><span class="chip pyl">VS. PY</span><span class="chip ${cls}">${up ? '+' : '−'}${fmt(Math.abs(diff))}${points ? '' : ''}</span><span class="chip ${cls}">${up ? '▲' : '▼'} ${up ? '+' : '−'}${(Math.abs(diff / before) * 100).toFixed(1)}%</span></div>`;
 }
+// ---- spend reconciliation: ledger, ad platforms and what Maestro presents, by month ----
+function reconCard() {
+  const R = ins.recon, months = R.months, at = new Map(months.map((m, i) => [m, i]));
+  if (!months.length) return '';
+  const l1n = Object.fromEntries(meta.level1.map((l) => [l.id, l.name])), bn = Object.fromEntries(meta.brands.map((b) => [b.id, b.name]));
+  const is = (k) => (c) => (c.kind === k ? 1 : 0);
+  // each row is a weight on every cell, so a difference row is just "shown minus ledger"
+  const vec = (w, keyOf) => { const by = new Map(); for (const c of R.cells) { const x = w(c); if (!x) continue; const k = keyOf ? keyOf(c) : 0; (by.get(k) || by.set(k, months.map(() => 0)).get(k))[at.get(c.month)] += x * c.v; } return by; };
+  const tot = (a) => a.reduce((x, y) => x + y, 0), cell = (v) => (Math.abs(v) < 0.5 ? '<span class="muted">—</span>' : money(v));
+  // closed months get their own total, so an open month's provisional figures do not blur whether the closed ones tie
+  const hasOpen = months.some((m) => !closed(m)), totClosed = (a) => a.reduce((x, v, i) => x + (closed(months[i]) ? v : 0), 0), red = (flag, v) => (flag && Math.abs(v) >= 100 ? 'down' : '');
+  const tds = (a, flag) => a.map((v) => `<td class="${red(flag, v)}">${cell(v)}</td>`).join('') + (hasOpen ? `<td class="${red(flag, totClosed(a))}"><b>${cell(totClosed(a))}</b></td>` : '') + `<td class="${red(flag, tot(a))}"><b>${cell(tot(a))}</b></td>`;
+  const row = (key, cls, label, w, { byBrand = false, flag = false, hideZero = false, help = '' } = {}) => {
+    const a = vec(w).get(0) || months.map(() => 0);
+    if (hideZero && !a.some((v) => Math.abs(v) >= 0.5)) return '';
+    const open = state.open.has('r:' + key);
+    let h = `<tr class="${cls}" data-key="r:${key}" style="cursor:pointer" ${help ? `title="${esc(help)}"` : ''}><td>${open ? '▾' : '▸'} ${label}</td>${tds(a, flag)}</tr>`;
+    if (open) {
+      const parts = [...vec(w, (c) => (byBrand ? c.brand_id : c.level1_id))].filter(([, x]) => x.some((v) => Math.abs(v) >= 0.5)).sort((x, y) => Math.abs(tot(y[1])) - Math.abs(tot(x[1])));
+      h += parts.map(([k, x]) => `<tr class="src"><td>${esc((byBrand ? bn[k] : l1n[k]) || 'Other')}</td>${tds(x, flag)}</tr>`).join('') || `<tr class="src"><td class="muted">Nothing in ${R.year}</td><td colspan="${months.length + (hasOpen ? 2 : 1)}"></td></tr>`;
+    }
+    return h;
+  };
+  const many = !state.brand, openM = months.filter((m) => !closed(m));
+  return `<div class="card"><h2>Spend reconciliation by month · ${R.year}</h2>
+    <p class="sub">The ledger is the official spend. Maestro starts from what the ad platforms report, then adds reconciling lines so that each closed month comes back to the ledger. Select a row to open it by ${many ? 'Level 1 (the difference row opens by brand)' : 'Level 1'}.</p>
+    <div class="scroll"><table><tr><th>Spend</th>${months.map((m) => `<th>${mlabel(m)}${closed(m) ? '' : ' *'}</th>`).join('')}${hasOpen ? '<th>Closed months</th>' : ''}<th>Total</th></tr>
+      ${row('ledger', 'ch', 'Ledger actual (Acumatica)', is('ledger'), { help: 'Marketing accounts posted in Acumatica (QuickBooks for Watkins Construction), in the ACTUAL and ACTUALCAD ledgers' })}
+      ${row('platform', 'ch', 'Third-party platform actual', is('platform'), { help: 'Google Ads, Bing Ads, Meta and Active Prospect, as reported by each platform feed' })}
+      ${row('assigned', 'l1', 'Reconciling: ledger lines assigned to CRM campaigns', is('assigned'), { hideZero: true, help: 'Ledger lines someone assigned to a CRM campaign on Mappings → Ledger spend' })}
+      ${row('other', 'l1', 'Reconciling: other GL spend (in the ledger, not on a platform)', is('other'), { help: 'Ledger spend that no platform feed reports: traditional media, agencies, events, and platform spend from before a feed was switched on' })}
+      ${row('timing', 'l1', 'Reconciling: platform spend not yet in the GL', is('timing'), { help: 'Negative: the platforms report more than the ledger has booked for that Level 1 and month, from invoice timing or account coding' })}
+      ${row('entered', 'l1', 'Reconciling: spend entered in Maestro', is('entered'), { hideZero: true })}
+      ${row('shown', 'total', 'Spend presented in Maestro', (c) => (c.kind === 'ledger' ? 0 : 1), { help: 'Third-party platform actual plus the reconciling lines. This is the spend on the cards, chart and table above.' })}
+      ${row('diff', 'ch', 'Difference: Maestro less ledger', (c) => (c.kind === 'ledger' ? -1 : 1), { byBrand: many, flag: true, help: 'Zero when a month is fully reconciled' })}
+    </table></div>
+    <p class="sub" style="margin:10px 0 0">A difference is left only where the ledger is not final: ${openM.length ? `open months (* ${openM.map(mlabel).join(', ')}), ` : ''}a brand-month with nothing posted in the ledger yet, or a brand that is not in any loaded ledger. There Maestro shows the platform figures as they are and does not net them down. Canadian brands are translated at ${meta.fx} throughout.${state.location ? ' For a single market location the reconciling lines are a share of the brand\'s, because platforms and the ledger do not always put spend on the same location, so a small difference by location is expected; it nets to zero for the brand.' : ''}</p></div>`;
+}
+
 async function insights(el) {
   const closedMonths = yearMonths().filter(closed);
   if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Projections screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
   if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
   const pyFrom = yearBack(state.dFrom), pyTo = yearBack(state.dTo), hasPy = pyFrom >= meta.months[0] + '-01';
-  const [f, range, series, py, pySeries] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
+  const [f, range, series, py, pySeries, recon] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
     hasPy ? api(`/api/totals?${scope()}&from=${pyFrom}&to=${pyTo}`) : null,
-    hasPy ? api(`/api/series?${scope()}&from=${pyFrom}&to=${pyTo}&grain=${state.grain}&group=channel`) : null]);
-  facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo };
+    hasPy ? api(`/api/series?${scope()}&from=${pyFrom}&to=${pyTo}&grain=${state.grain}&group=channel`) : null,
+    api(`/api/recon?${scope()}&year=${state.year}`)]);
+  facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo, recon };
   if (state.chartMode === 'compare') ins.plan = await api(`/api/projections?${scope()}&year=${state.year}`);
   drawInsights(el);
 }
@@ -310,6 +350,7 @@ function drawInsights(el) {
       <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${ins.pySeries && state.grain !== 'day' && state.chartMode !== 'compare' ? '<span class="lg-py"><i></i>Same period last year</span>' : ''}</div>
       <div class="chart" id="chart"></div>${dayNote}
     </div>
+    ${reconCard()}
     <div class="card"><div class="row" style="justify-content:space-between"><h2>Channel and Level 1 performance</h2>
       <div class="row"><span class="ctl-l">Spend against</span><div class="seg upper"><button data-vs="budget" class="${vsPlan ? '' : 'on'}">Budget</button><button data-vs="plan" class="${vsPlan ? 'on' : ''}">Projection</button></div></div></div>
       <p class="sub">${rangeText}. ${vsPlan ? 'The Projection column is the current plan for these dates: hand-entered projections where they exist, otherwise the budget. Level 1 projections follow their channel.' : 'The Budget column is the budget as loaded, by channel and Level 1.'} Level 1 spend for closed months equals the ledger: platform campaigns sit underneath at their own amounts, with "Other GL spend" and "Platform spend not yet in GL" lines making up the difference. Select a row to expand. A campaign is flagged when its ROAS is under half the blended ${blended.toFixed(1)}x.</p>
@@ -411,68 +452,115 @@ const KPIS = {
   bookings: { name: 'Bookings $', help: 'Final contract value of every sold or completed project closed in the period, including additional projects.', fmt: (v) => money(v), of: (r) => r.bookings, records: true, additive: true, crm: true },
   roas: { name: 'ROAS', help: 'Bookings $ divided by spend. MCOB is the same relationship the other way round: spend as a share of bookings.', fmt: (v) => (v == null ? '—' : v.toFixed(1) + 'x'), of: (r) => (r.spend > 0.5 ? r.bookings / r.spend : null), records: false, additive: false, crm: false },
 };
-const ZOOM_DIMS = [['brand', 'Brand'], ['location', 'Market location'], ['service', 'Service offering'], ['ctype', 'Customer type']];
+const ZOOM_FILTERS = { brand: 'Brand', location: 'Market location', service: 'Service offering', ctype: 'Customer type' };
 let zoom = null;
 function openZoom(measure) {
-  zoom = { measure, dim: state.brand ? 'location' : 'brand', f: {}, view: 'breakdown' };
+  zoom = { measure, tab: KPIS[measure].crm ? 'overview' : 'brand', f: {}, view: 'breakdown', open: new Set(), cache: {} };
   drawZoom();
 }
+// The Zoom window, laid out like the BI portal's: an Overview with service offering and customer type side by side,
+// and a "By Brand & Market" tab where a brand opens to its market locations. Every figure carries its change on last year.
 async function drawZoom() {
   let dlg = $('#drill');
   if (!dlg) { dlg = document.createElement('dialog'); dlg.id = 'drill'; document.body.appendChild(dlg); dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); }); }
   if (!dlg.open) { dlg.innerHTML = '<p class="sub" style="margin:0">Loading…</p>'; dlg.showModal(); }
   const k = KPIS[zoom.measure], f = zoom.f;
-  const fq = Object.entries(f).map(([d, v]) => `&f_${d}=${encodeURIComponent(v.key)}`).join('');
-  const dimName = Object.fromEntries(ZOOM_DIMS);
-  const labelOf = (dim, key) => (dim === 'brand' ? meta.brands.find((b) => b.id === key)?.name : dim === 'location' ? meta.locations.find((l) => l.id === key)?.name : key) || '(Not recorded)';
-  const chips = Object.entries(f).map(([d, v]) => `<button class="chip fchip" data-unf="${d}" title="Remove this filter">${dimName[d]}: ${esc(v.label)} ✕</button>`).join(' ');
+  const fqOf = (skip) => Object.entries(f).filter(([d]) => d !== skip).map(([d, v]) => `&f_${d}=${encodeURIComponent(v.key)}`).join('');
+  const hasPy = yearBack(state.dFrom) >= meta.months[0] + '-01', pyRange = `${scope()}&from=${yearBack(state.dFrom)}&to=${yearBack(state.dTo)}`;
+  const get = (dim, py, skip) => { const u = `/api/zoom?${py ? pyRange : rangeQuery()}&dim=${dim}${fqOf(skip)}`; return (zoom.cache[u] ||= api(u)); };
+  const brandName = (id) => meta.brands.find((b) => b.id === id)?.name, locName = (id) => meta.locations.find((l) => l.id === id)?.name;
+  const nBrands = meta.brands.filter((b) => (!state.region || b.region === state.region) && (!state.division || b.division === state.division)).length;
+  const scopeText = [state.brand ? brandName(Number(state.brand)) : `All ${nBrands} brands`, !state.brand && (state.region || state.division), state.location && locName(Number(state.location))].filter(Boolean).map(esc).join(' · ');
+  const chips = Object.entries(f).map(([d, v]) => `<button class="chip fchip" data-unf="${d}" title="Remove this filter">${ZOOM_FILTERS[d]}: ${esc(v.label)} ✕</button>`).join(' ');
+  const recUrl = `/api/records?${rangeQuery()}&measure=${zoom.measure}${fqOf()}`;
   const head = `
-    <div class="row" style="justify-content:space-between;align-items:flex-start">
-      <div><h2>${k.name} <span class="hl">Zoom</span></h2><p class="sub" style="margin:0">${niceDay(state.dFrom)} to ${niceDay(state.dTo)}. ${esc(k.help)}</p></div>
-      <button id="d-close" aria-label="Close">Close ✕</button>
+    <div class="zhead">
+      <div><h2 class="ztitle">${k.name}</h2><p class="zmeta">${niceDay(state.dFrom)} – ${niceDay(state.dTo)} · ${scopeText}</p><p class="zdef">${esc(k.help)}</p></div>
+      <div class="row" style="flex-wrap:nowrap">${k.records ? `${zoom.view === 'records' ? '' : `<button id="z-rec">View ${zoom.measure === 'spend' ? 'ledger lines' : 'records'}</button>`}<a class="btn" href="${recUrl}&format=csv&cur=${state.cur}" download>Export CSV</a>` : ''}<button id="d-close" class="zx" aria-label="Close">✕</button></div>
     </div>
-    ${chips ? `<p style="margin:8px 0 0">${chips}</p>` : ''}`;
-  const close = () => { $('#d-close', dlg).onclick = () => dlg.close(); $$('[data-unf]', dlg).forEach((b) => (b.onclick = () => { delete zoom.f[b.dataset.unf]; zoom.view = 'breakdown'; drawZoom(); })); };
+    ${chips ? `<p style="margin:12px 0 0"><span class="zcap" style="margin-right:8px">Filtered to</span>${chips}</p>` : ''}`;
+  const wire = () => {
+    $('#d-close', dlg).onclick = () => dlg.close();
+    if ($('#z-rec', dlg)) $('#z-rec', dlg).onclick = () => { zoom.view = 'records'; drawZoom(); };
+    $$('[data-unf]', dlg).forEach((b) => (b.onclick = () => { delete zoom.f[b.dataset.unf]; drawZoom(); }));
+    $$('[data-ztab]', dlg).forEach((b) => (b.onclick = () => { zoom.tab = b.dataset.ztab; zoom.view = 'breakdown'; drawZoom(); }));
+  };
+  const fail = (e) => { dlg.innerHTML = head + `<p>${esc(e.message)}</p>`; wire(); };
 
   if (zoom.view === 'records') {
-    const url = `/api/records?${rangeQuery()}&measure=${zoom.measure}${fq}`;
-    let d; try { d = await api(url); } catch (e) { dlg.innerHTML = head + `<p>${esc(e.message)}</p>`; close(); return; }
+    let d; try { d = await api(recUrl); } catch (e) { return fail(e); }
     const isMoney = (c) => /Amount|Contract/.test(c);
     dlg.innerHTML = head + `
-      <div class="row" style="justify-content:space-between;margin-top:12px"><p class="sub" style="margin:0"><button class="link" id="z-back">‹ Back to the breakdown</button> · ${d.count.toLocaleString()} ${zoom.measure === 'spend' ? 'ledger lines' : 'records'}${d.count > d.shown ? `, showing the first ${d.shown.toLocaleString()}` : ''} · total ${money(d.total)}</p>
-        <a class="btn" href="${url}&format=csv&cur=${state.cur}" download>Download all as CSV</a></div>
+      <p class="sub" style="margin:14px 0 0"><button class="link" id="z-back">‹ Back to the breakdown</button> · ${d.count.toLocaleString()} ${zoom.measure === 'spend' ? 'ledger lines' : 'records'}${d.count > d.shown ? `, showing the first ${d.shown.toLocaleString()}` : ''} · total ${money(d.total)}</p>
       ${zoom.measure === 'spend' ? '<p class="sub" style="margin:6px 0 0">These are the ledger lines for the months in the period, which is the official spend. Ad-platform campaign detail is in the chart drill-down. Brands or months with no ledger loaded have no lines here.</p>' : ''}
-      <div class="scroll" style="max-height:56vh;overflow-y:auto;margin-top:10px"><table><tr>${d.cols.map((c, i) => `<th class="${isMoney(c) ? '' : 'l'}">${esc(c)}</th>`).join('')}</tr>
+      <div class="scroll" style="max-height:56vh;overflow-y:auto;margin-top:10px"><table><tr>${d.cols.map((c) => `<th class="${isMoney(c) ? '' : 'l'}">${esc(c)}</th>`).join('')}</tr>
         ${d.rows.map((r) => `<tr>${r.map((v, i) => `<td class="${isMoney(d.cols[i]) ? '' : 'l'}">${v == null || v === '' ? '—' : isMoney(d.cols[i]) ? money(v) : esc(v)}</td>`).join('')}</tr>`).join('') || `<tr><td class="l muted" colspan="${d.cols.length}">No records for this selection.</td></tr>`}</table></div>`;
-    close(); $('#z-back', dlg).onclick = () => { zoom.view = 'breakdown'; drawZoom(); };
+    wire(); $('#z-back', dlg).onclick = () => { zoom.view = 'breakdown'; drawZoom(); };
     return;
   }
 
-  let d; try { d = await api(`/api/zoom?${rangeQuery()}&dim=${zoom.dim}${fq}`); } catch (e) { dlg.innerHTML = head + `<p>${esc(e.message)}</p>`; close(); return; }
-  const crmOnly = !d.hasSpend, blocked = !k.crm && crmOnly;
-  const rows = d.rows.map((r) => ({ ...r, label: labelOf(zoom.dim, r.key), v: k.of(r) })).filter((r) => r.spend || r.leads || r.appts || r.sales || r.bookings).sort((a, b) => (b.v ?? -1) - (a.v ?? -1));
-  const T = rows.reduce((t, r) => { for (const x of ['spend', 'leads', 'appts', 'sales', 'bookings']) t[x] += r[x] || 0; return t; }, { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
-  if (crmOnly) T.spend = null;
-  const totalV = k.of(T), max = Math.max(1, ...rows.map((r) => Math.abs(r.v || 0)));
-  const next = ZOOM_DIMS.map(([id]) => id).filter((id) => id !== zoom.dim && !f[id]).find((id) => ZOOM_DIMS.findIndex(([x]) => x === id) > ZOOM_DIMS.findIndex(([x]) => x === zoom.dim));
-  // CPA and MCOB need spend, so they are blank on the service offering and customer type breakdowns.
-  const cells = (r) => `<td>${r.spend == null ? '—' : money(r.spend)}</td><td>${int(r.leads)}</td><td>${int(r.appts)}</td><td>${int(r.sales)}</td><td>${money(r.bookings)}</td>
-    <td>${r.spend == null ? '—' : cost(r.spend, r.appts)}</td><td>${ratio(r.sales, r.appts, pct)}</td><td>${r.spend == null ? '—' : ratio(r.spend, r.bookings, pct)}</td>`;
-  const tab = ([id, name]) => { const off = f[id] || ((id === 'service' || id === 'ctype') && (!k.crm || !d.hasRecords)); return `<button data-zdim="${id}" class="${id === zoom.dim ? 'on' : ''}" ${off ? `disabled title="${f[id] ? 'Already filtered' : !d.hasRecords ? 'Needs CRM records, which the demo data does not have' : 'Not recorded for this measure'}"` : ''}>${name}</button>`; };
-  dlg.innerHTML = head + `
-    <div class="row" style="justify-content:space-between;margin-top:12px"><div class="tabs" style="margin:0;border:0">${ZOOM_DIMS.map(tab).join('')}</div>
-      <p class="sub" style="margin:0">${next ? `Select a row to filter to it and continue to ${dimName[next]}.` : 'Select a row to filter to it.'} ${k.records ? 'Select the total to list the underlying records.' : ''}</p></div>
-    ${!k.crm ? '<p class="sub" style="margin:6px 0 0">Service offering and customer type are recorded on CRM records only, so they are not available for spend-based measures.</p>' : ''}
-    ${blocked ? '<p style="margin-top:12px">This measure needs spend, which is not recorded by service offering or customer type. Remove that filter to see it.</p>' : `
-    <div class="scroll" style="max-height:56vh;overflow-y:auto;margin-top:10px"><table>
-      <tr><th>${dimName[zoom.dim]}</th><th>${k.name}</th><th class="l" style="width:16%">${k.additive ? 'Share' : ''}</th><th>Spend</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Bookings $</th><th title="Spend per appointment">CPA</th><th title="Sales as a share of appointments">Closing rate</th><th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th></tr>
-      ${rows.map((r, i) => `<tr class="zrow" data-zrow="${i}" title="Filter to ${esc(r.label)}"><td>${esc(r.label)}</td><td><b>${r.v == null ? '—' : k.fmt(r.v)}</b></td>
-        <td class="l">${k.additive ? `<span class="bar"><i style="width:${Math.max(1, (Math.abs(r.v) / max) * 100)}%"></i></span> <span class="muted">${totalV ? pct(r.v / totalV) : ''}</span>` : ''}</td>${cells(r)}</tr>`).join('') || '<tr><td class="l muted" colspan="11">Nothing in this period for this selection.</td></tr>'}
-      <tr class="total ${k.records ? 'zrow' : ''}" ${k.records ? 'id="z-total" title="List the underlying records"' : ''}><td>Total${k.records ? ' <span class="muted" style="font-weight:400">· view records ›</span>' : ''}</td><td>${totalV == null ? '—' : k.fmt(totalV)}</td><td></td>${cells(T)}</tr></table></div>`}`;
-  close();
-  $$('[data-zdim]', dlg).forEach((b) => (b.onclick = () => { zoom.dim = b.dataset.zdim; drawZoom(); }));
-  $$('[data-zrow]', dlg).forEach((tr) => (tr.onclick = () => { const r = rows[Number(tr.dataset.zrow)]; zoom.f[zoom.dim] = { key: r.key ?? '', label: r.label }; if (next) zoom.dim = next; else zoom.view = k.records ? 'records' : 'breakdown'; drawZoom(); }));
-  if ($('#z-total', dlg)) $('#z-total', dlg).onclick = () => { zoom.view = 'records'; drawZoom(); };
+  // ---- shared pieces
+  const FIELDS = ['spend', 'leads', 'appts', 'sales', 'bookings'];
+  const live = (r) => FIELDS.some((x) => r[x]);
+  const sumOf = (rows, noSpend) => { const t = rows.reduce((a, r) => { for (const x of FIELDS) a[x] += r[x] || 0; return a; }, { spend: 0, leads: 0, appts: 0, sales: 0, bookings: 0 }); if (noSpend) t.spend = null; return t; };
+  const vsPy = (now, before) => {
+    if (!hasPy || now == null || before == null || !(Math.abs(before) > 1e-9)) return '<span class="muted">—</span>';
+    const d = now / before - 1, up = d >= 0;
+    return `<span class="zpy ${zoom.measure === 'spend' ? 'flat' : up ? 'up' : 'down'}">${up ? '▲ +' : '▼ −'}${(Math.abs(d) * 100).toFixed(1)}%</span>`;
+  };
+  const val = (v) => (v == null ? '—' : k.fmt(v));
+  const banner = (label, now, before) => `<div class="zbanner"><span>${label}</span><span><b>${val(now)}</b>${hasPy ? `${vsPy(now, before)} <small>vs PY</small>` : ''}</span></div>`;
+  const tabs = (overviewOff) => `<div class="ztabs" role="tablist"><button data-ztab="overview" class="${zoom.tab === 'overview' ? 'on' : ''}" ${overviewOff ? `disabled title="${esc(overviewOff)}"` : ''}>Overview</button><button data-ztab="brand" class="${zoom.tab === 'brand' ? 'on' : ''}">By Brand &amp; Market</button></div>`;
+  const noOverview = !k.crm ? 'Service offering and customer type are recorded on CRM records only, so they are not available for spend-based measures' : zoom.noRecords ? 'Needs CRM records, which the demo data does not have' : '';
+
+  // ---- Overview: service offering and customer type side by side
+  if (zoom.tab === 'overview' && !noOverview) {
+    let D; try { D = await Promise.all([get('service', false, 'service'), get('ctype', false, 'ctype'), hasPy ? get('service', true, 'service') : null, hasPy ? get('ctype', true, 'ctype') : null]); } catch (e) { return fail(e); }
+    if (!D[0].hasRecords) { zoom.noRecords = true; zoom.tab = 'brand'; return drawZoom(); }
+    const panel = (dim, title, d, p) => {
+      const before = new Map((p?.rows || []).map((r) => [r.key ?? '', k.of(r)]));
+      const rows = d.rows.filter(live).map((r) => ({ ...r, key: r.key ?? '', v: k.of(r) })).filter((r) => r.v).sort((a, b) => (b.v ?? -1) - (a.v ?? -1));
+      const sel = f[dim]?.key, picked = sel != null ? rows.filter((r) => r.key === sel) : rows;
+      const total = k.of(sumOf(picked, true)), totalPy = p ? k.of(sumOf(sel != null ? p.rows.filter((r) => (r.key ?? '') === sel) : p.rows, true)) : null;
+      return `<div><p class="zcap">By ${title}</p>${banner(sel != null ? esc(f[dim].label) : 'Total', total, totalPy)}
+        <div class="scroll" style="max-height:48vh;overflow-y:auto;margin-top:6px"><table class="ztable"><tr><th>Name</th><th>Actual ▼</th>${hasPy ? '<th>vs PY</th>' : ''}</tr>
+        ${rows.map((r) => `<tr class="${r.key ? 'zrow' : ''} ${sel == null ? '' : r.key === sel ? 'sel' : 'dim'}" ${r.key ? `data-zpick="${dim}" data-key="${esc(r.key)}" title="${r.key === sel ? 'Remove this filter' : `Filter everything to ${esc(r.key)}`}"` : ''}><td>${esc(r.key || '(Unspecified)')}</td><td>${val(r.v)}</td>${hasPy ? `<td>${vsPy(r.v, before.get(r.key))}</td>` : ''}</tr>`).join('') || '<tr><td class="muted" colspan="3">Nothing in this period.</td></tr>'}</table></div></div>`;
+    };
+    dlg.innerHTML = head + tabs() + `<div class="zgrid">${panel('service', 'service offering', D[0], D[2])}${panel('ctype', 'customer type', D[1], D[3])}</div>
+      <p class="sub" style="margin:14px 0 0">Select a row to filter the whole window to it; select it again to clear. Service offering and customer type come from CRM records, so spend, CPA and MCOB are not available at this level.</p>`;
+    wire();
+    $$('[data-zpick]', dlg).forEach((tr) => (tr.onclick = () => { const d = tr.dataset.zpick, key = tr.dataset.key; if (f[d]?.key === key) delete f[d]; else f[d] = { key, label: key }; drawZoom(); }));
+    return;
+  }
+
+  // ---- By Brand & Market: a brand opens to its market locations
+  zoom.tab = 'brand';
+  let B; try { B = await Promise.all([get('brand'), get('location'), hasPy ? get('brand', true) : null, hasPy ? get('location', true) : null]); } catch (e) { return fail(e); }
+  const withSpend = B[0].hasSpend, blocked = !k.crm && !withSpend;
+  const prep = (d) => d.rows.filter(live).map((r) => ({ ...r, v: k.of(r) })).sort((a, b) => (b.v ?? -1) - (a.v ?? -1));
+  const brands = prep(B[0]), locs = prep(B[1]), locBrand = new Map(meta.locations.map((l) => [l.id, l.brand_id]));
+  const pyB = new Map((B[2]?.rows || []).map((r) => [r.key, k.of(r)])), pyL = new Map((B[3]?.rows || []).map((r) => [r.key, k.of(r)]));
+  const T = sumOf(brands, !withSpend), totalV = k.of(T), totalPy = B[2] ? k.of(sumOf(B[2].rows, !withSpend)) : null;
+  const one = brands.length === 1, canFilter = k.crm && B[0].hasRecords;
+  const tds = (r, before) => `<td><b>${val(r.v)}</b></td>${hasPy ? `<td>${vsPy(r.v, before)}</td>` : ''}
+    ${k.additive ? `<td class="l"><span class="bar"><i style="width:${totalV ? Math.max(1, Math.min(100, (Math.abs(r.v) / Math.abs(totalV)) * 100)) : 0}%"></i></span> <span class="muted">${totalV ? pct(r.v / totalV) : ''}</span></td>` : ''}
+    ${withSpend ? `<td>${cost(r.spend, r.appts)}</td>` : ''}<td>${ratio(r.sales, r.appts, pct)}</td>${withSpend ? `<td>${ratio(r.spend, r.bookings, pct)}</td>` : ''}
+    <td class="l">${canFilter ? `<button class="link" data-zf="${r.dim}:${r.key}" title="Service offering and customer type for ${esc(r.label)}">Overview ›</button>` : ''}</td>`;
+  const body = brands.map((b) => {
+    const open = one || zoom.open.has(b.key), mine = locs.filter((l) => locBrand.get(l.key) === b.key);
+    return `<tr class="zrow" data-zopen="${b.key}"><td>${open ? '▾' : '▸'} ${esc(brandName(b.key) || 'Other')} <span class="muted">(${mine.length})</span></td>${tds({ ...b, dim: 'brand', label: brandName(b.key) }, pyB.get(b.key))}</tr>` +
+      (open ? mine.map((l) => `<tr class="sub"><td>${esc(locName(l.key) || 'Other')}</td>${tds({ ...l, dim: 'location', label: locName(l.key) }, pyL.get(l.key))}</tr>`).join('') : '');
+  }).join('');
+  const nCols = 4 + (hasPy ? 1 : 0) + (k.additive ? 1 : 0) + (withSpend ? 2 : 0);
+  dlg.innerHTML = head + tabs(noOverview) + (blocked ? '<p>This measure needs spend, which is not recorded by service offering or customer type. Remove that filter to see it.</p>' : `
+    ${banner(`${brands.length === 1 ? esc(brandName(brands[0].key) || '') : `${brands.length} brands`} · total`, totalV, totalPy)}
+    <div class="scroll" style="max-height:50vh;overflow-y:auto;margin-top:6px"><table class="ztable"><tr><th>Brand / market location</th><th>Actual ▼</th>${hasPy ? '<th>vs PY</th>' : ''}${k.additive ? '<th class="l" style="width:18%">Share of total</th>' : ''}
+      ${withSpend ? '<th title="Spend per appointment">CPA</th>' : ''}<th title="Sales as a share of appointments">Closing rate</th>${withSpend ? '<th title="Marketing cost of bookings: spend as a share of bookings">MCOB</th>' : ''}<th></th></tr>
+      ${body || `<tr><td class="muted" colspan="${nCols}">Nothing in this period for this selection.</td></tr>`}</table></div>
+    <p class="sub" style="margin:14px 0 0">Select a brand to open its market locations.${canFilter ? ' "Overview ›" shows that brand or location by service offering and customer type.' : ''}${withSpend ? '' : ' Spend is not recorded by service offering or customer type, so CPA and MCOB are hidden while that filter is on.'}</p>`);
+  wire();
+  $$('[data-zopen]', dlg).forEach((tr) => (tr.onclick = () => { const id = Number(tr.dataset.zopen); zoom.open.has(id) ? zoom.open.delete(id) : zoom.open.add(id); drawZoom(); }));
+  $$('[data-zf]', dlg).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const [d, id] = b.dataset.zf.split(':'), key = Number(id); if (d === 'location') delete f.brand; else delete f.location; f[d] = { key, label: (d === 'brand' ? brandName(key) : locName(key)) || '' }; zoom.tab = 'overview'; drawZoom(); }));
 }
 
 // ---- Projections -----------------------------------------------------------
