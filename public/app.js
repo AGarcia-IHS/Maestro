@@ -371,42 +371,6 @@ function attentionCard(rangeText) {
     ${items.length > 6 ? `<button id="attn-more" style="margin-top:10px">${state.attnAll ? 'Show the top 6' : `Show all ${items.length}`}</button>` : ''}` : '<p style="margin:0">Nothing in this view is more than 10% off budget.</p>'}</div>`;
 }
 
-// ---- time frame ------------------------------------------------------------
-// Ready-made periods for the Marketing Dashboard and Insights, counted back from the last day of data. Each one sets the
-// same From and To the screens' own pickers do, with a chart interval that suits its length.
-function timeFrames() {
-  const through = meta.dataThrough, t = toDate(through), y = t.getFullYear(), m = t.getMonth(), q = Math.floor(m / 3) * 3, d = (yy, mm, dd) => iso(new Date(yy, mm, dd, 12));
-  const mon = new Date(t); mon.setDate(t.getDate() - ((t.getDay() + 6) % 7)); // weeks run Monday to Sunday, as on the charts
-  const first = meta.months[0] + '-01', from = (a) => (a < first ? first : a);
-  return [
-    ['wtd', 'WTD', 'Week to date', iso(mon), through, 'day'],
-    ['lwk', 'LWK', 'Last week', d(mon.getFullYear(), mon.getMonth(), mon.getDate() - 7), d(mon.getFullYear(), mon.getMonth(), mon.getDate() - 1), 'day'],
-    ['mtd', 'MTD', 'Month to date', d(y, m, 1), through, 'day'],
-    ['lmo', 'Last Mo', 'Last month', d(y, m - 1, 1), d(y, m, 0), 'day'],
-    ['lqt', 'Last Qtr', 'Last quarter', d(y, q - 3, 1), d(y, q, 0), 'week'],
-    ['qtd', 'QTD', 'Quarter to date', d(y, q, 1), through, 'week'],
-    ['ytd', 'YTD', 'Year to date', d(y, 0, 1), through, 'month'],
-  ].map(([k, name, title, a, b, grain]) => ({ k, name, title, from: from(a), to: b, grain })).filter((f) => f.to >= first);
-}
-function drawTimeFrame() {
-  const on = ['dashboard', 'insights'].includes(location.hash.slice(1) || 'dashboard');
-  $('#tf').hidden = !on;
-  if (!on || !meta) return;
-  const frames = timeFrames(), now = state.tfCustom ? null : frames.find((f) => f.from === state.dFrom && f.to === state.dTo);
-  $('#tf-b').innerHTML = frames.map((f) => `<button data-tf="${f.k}" class="${f === now ? 'on' : ''}" title="${f.title}: ${niceDay(f.from)} to ${niceDay(f.to)}">${f.name}</button>`).join('')
-    + `<button data-tf="custom" class="${now ? '' : 'on'}" title="Any dates, set with From and To on the screen${state.dFrom ? `. Now ${niceDay(state.dFrom)} to ${niceDay(state.dTo)}` : ''}">Custom</button>`;
-  $$('[data-tf]', $('#tf-b')).forEach((b) => (b.onclick = () => {
-    const f = frames.find((x) => x.k === b.dataset.tf);
-    if (!f) { state.tfCustom = true; state.dateMode = 'dates'; render(); return; } // Custom: show the date pickers
-    state.tfCustom = false;
-    state.dFrom = f.from; state.dTo = f.to; state.grain = f.grain; state.prevRange = null;
-    state.dateMode = f.from.endsWith('-01') && f.to === monthEnd(f.to.slice(0, 7)) ? 'months' : 'dates';
-    const yr = f.to.slice(0, 4); if (meta.years.includes(yr)) { state.year = yr; $('#f-year').value = yr; }
-    state.rangeYear = state.year;
-    render();
-  }));
-}
-
 // ---- Insights: what needs attention, and where the month is heading ----------
 // Shares the filters and the period with the Marketing Dashboard, so moving between the two keeps your place.
 async function attentionView(el) {
@@ -420,7 +384,6 @@ async function attentionView(el) {
   const opts = (sel) => months.map((m) => `<option ${m === sel ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('');
   const setRange = (a, b) => { state.prevRange = null; state.dFrom = a; state.dTo = b > through ? through : b; attentionView(el); };
   const draw = () => {
-    drawTimeFrame();
     const a = state.dFrom.slice(0, 7), b = state.dTo.slice(0, 7), whole = state.dFrom.endsWith('-01') && state.dTo === monthEnd(b);
     const rangeText = whole ? (a === b ? bucketTitle.month(a) : `${bucketTitle.month(a)} to ${bucketTitle.month(b)}`) : `${niceDay(state.dFrom)} to ${niceDay(state.dTo)}`;
     el.innerHTML = `
@@ -456,7 +419,6 @@ async function insights(el) {
   drawInsights(el);
 }
 function drawInsights(el) {
-  drawTimeFrame();
   const l1 = Object.fromEntries(meta.level1.map((l) => [l.id, l])), ch = Object.fromEntries(meta.channels.map((c) => [c.id, c]));
   const zero = () => ({ actual: 0, budget: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
   const camps = new Map(facts.campaigns.map((c) => [c.id, { ...c, level1: l1[c.level1_id], channel: ch[l1[c.level1_id].channel_id], t: zero() }]));
@@ -1311,7 +1273,6 @@ async function imports(el) {
 const VIEWS = { dashboard: insights, insights: attentionView, projections, campaigns, mappings, import: imports };
 async function render() {
   const name = VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : 'dashboard';
-  drawTimeFrame();
   $$('#nav a').forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#' + name));
   try { await VIEWS[name]($('#view')); } catch (e) { $('#view').innerHTML = `<div class="card">Could not load this screen: ${esc(e.message)}</div>`; }
 }
