@@ -186,10 +186,10 @@ function pivot(data, measure, names, colorOf) {
   return [...by.values()].map((s) => ({ ...s, values: rt ? s.values.map((v, i) => (s.den[i] > 0.5 ? v / s.den[i] : null)) : s.values, color: colorOf(s.id) }));
 }
 
-// ---- Insights --------------------------------------------------------------
+// ---- Marketing Dashboard ---------------------------------------------------
 const MEASURES = { spend: 'Spend', leads: 'Leads', appts: 'Appointments', sales: 'Sales', bookings: 'Bookings $' };
 const rangeQuery = () => scope() + `&from=${state.dFrom}&to=${state.dTo}`;
-let ins = null; // what the Insights screen last loaded
+let ins = null; // what the Marketing Dashboard and Insights screens last loaded
 // ---- chart measures ----------------------------------------------------------
 // The trend chart can show the five funnel stages or the five ratios. Ratios cannot be stacked, so they are drawn as lines.
 const RATIO_NAMES = { cpl: 'CPL', cpa: 'CPA', mcob: 'MCOB', conv: 'Conversion', close: 'Closing rate' };
@@ -366,27 +366,97 @@ function attentionCard(rangeText) {
   const items = attention(), shown = state.attnAll ? items : items.slice(0, 6), what = state.location ? '' : state.brand ? 'market location' : 'brand';
   if (!ins.cmp) return '';
   return `<div class="card"><h2>Needs attention</h2>
-    <p class="sub">${rangeText} against budget${ins.pace?.month ? `, and ${bucketTitle.month(ins.pace.month)} at its pace so far` : ''}: everything more than 10% off, the largest of each kind first, sized by what it is worth in dollars (for appointments, at the average bookings per appointment). Outcomes are by lead date, so the newest months are still filling in against a budget that is not.${what ? ` Select a line to narrow the screen to that ${what}.` : ''}</p>
+    <p class="sub">${rangeText} against budget${ins.pace?.month ? `, and ${bucketTitle.month(ins.pace.month)} at its pace so far` : ''}: everything more than 10% off, the largest of each kind first, sized by what it is worth in dollars (for appointments, at the average bookings per appointment). Outcomes are by lead date, so the newest months are still filling in against a budget that is not.${what ? ` Select a line to open the Marketing Dashboard for that ${what}.` : ''}</p>
     ${items.length ? `<div class="attn">${shown.map((i) => `<div class="attn-i${i.go ? ' go' : ''}" ${i.go}><span class="chip ${i.cls}">${i.tag}</span><span>${i.text}</span><b class="amt">${compact(i.impact)}</b></div>`).join('')}</div>
     ${items.length > 6 ? `<button id="attn-more" style="margin-top:10px">${state.attnAll ? 'Show the top 6' : `Show all ${items.length}`}</button>` : ''}` : '<p style="margin:0">Nothing in this view is more than 10% off budget.</p>'}</div>`;
 }
 
-async function insights(el) {
+// ---- time frame ------------------------------------------------------------
+// Ready-made periods for the Marketing Dashboard and Insights, counted back from the last day of data. Each one sets the
+// same From and To the screens' own pickers do, with a chart interval that suits its length.
+function timeFrames() {
+  const through = meta.dataThrough, t = toDate(through), y = t.getFullYear(), m = t.getMonth(), q = Math.floor(m / 3) * 3, d = (yy, mm, dd) => iso(new Date(yy, mm, dd, 12));
+  const mon = new Date(t); mon.setDate(t.getDate() - ((t.getDay() + 6) % 7)); // weeks run Monday to Sunday, as on the charts
+  const first = meta.months[0] + '-01', from = (a) => (a < first ? first : a);
+  return [
+    ['wtd', 'WTD', 'Week to date', iso(mon), through, 'day'],
+    ['lwk', 'LWK', 'Last week', d(mon.getFullYear(), mon.getMonth(), mon.getDate() - 7), d(mon.getFullYear(), mon.getMonth(), mon.getDate() - 1), 'day'],
+    ['mtd', 'MTD', 'Month to date', d(y, m, 1), through, 'day'],
+    ['lmo', 'Last Mo', 'Last month', d(y, m - 1, 1), d(y, m, 0), 'day'],
+    ['lqt', 'Last Qtr', 'Last quarter', d(y, q - 3, 1), d(y, q, 0), 'week'],
+    ['qtd', 'QTD', 'Quarter to date', d(y, q, 1), through, 'week'],
+    ['ytd', 'YTD', 'Year to date', d(y, 0, 1), through, 'month'],
+  ].map(([k, name, title, a, b, grain]) => ({ k, name, title, from: from(a), to: b, grain })).filter((f) => f.to >= first);
+}
+function drawTimeFrame() {
+  const on = ['dashboard', 'insights'].includes(location.hash.slice(1) || 'dashboard');
+  $('#tf').hidden = !on;
+  if (!on || !meta) return;
+  const frames = timeFrames(), now = state.tfCustom ? null : frames.find((f) => f.from === state.dFrom && f.to === state.dTo);
+  $('#tf-b').innerHTML = frames.map((f) => `<button data-tf="${f.k}" class="${f === now ? 'on' : ''}" title="${f.title}: ${niceDay(f.from)} to ${niceDay(f.to)}">${f.name}</button>`).join('')
+    + `<button data-tf="custom" class="${now ? '' : 'on'}" title="Any dates, set with From and To on the screen${state.dFrom ? `. Now ${niceDay(state.dFrom)} to ${niceDay(state.dTo)}` : ''}">Custom</button>`;
+  $$('[data-tf]', $('#tf-b')).forEach((b) => (b.onclick = () => {
+    const f = frames.find((x) => x.k === b.dataset.tf);
+    if (!f) { state.tfCustom = true; state.dateMode = 'dates'; render(); return; } // Custom: show the date pickers
+    state.tfCustom = false;
+    state.dFrom = f.from; state.dTo = f.to; state.grain = f.grain; state.prevRange = null;
+    state.dateMode = f.from.endsWith('-01') && f.to === monthEnd(f.to.slice(0, 7)) ? 'months' : 'dates';
+    const yr = f.to.slice(0, 4); if (meta.years.includes(yr)) { state.year = yr; $('#f-year').value = yr; }
+    state.rangeYear = state.year;
+    render();
+  }));
+}
+
+// ---- Insights: what needs attention, and where the month is heading ----------
+// Shares the filters and the period with the Marketing Dashboard, so moving between the two keeps your place.
+async function attentionView(el) {
   const closedMonths = yearMonths().filter(closed);
-  if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. Insights fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Budget Manager screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
+  if (!closedMonths.length) { el.innerHTML = `<h1>Maestro <span class="hl">Insights</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there is nothing to set against budget.</div>`; return; }
   if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
   const pyFrom = yearBack(state.dFrom), pyTo = yearBack(state.dTo), hasPy = pyFrom >= meta.months[0] + '-01';
-  const [f, range, series, py, pySeries, recon, pyRange, cmp, pace] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
+  const [cmp, pace] = await Promise.all([api(`/api/compare?${rangeQuery()}${hasPy ? `&pfrom=${pyFrom}&pto=${pyTo}` : ''}`), api('/api/pacing?' + scope())]);
+  ins = { ...(ins || {}), cmp, pace };
+  const through = meta.dataThrough, months = meta.months.filter((m) => m <= through.slice(0, 7));
+  const opts = (sel) => months.map((m) => `<option ${m === sel ? 'selected' : ''} value="${m}">${mlabel(m)} ${m.slice(0, 4)}</option>`).join('');
+  const setRange = (a, b) => { state.prevRange = null; state.dFrom = a; state.dTo = b > through ? through : b; attentionView(el); };
+  const draw = () => {
+    drawTimeFrame();
+    const a = state.dFrom.slice(0, 7), b = state.dTo.slice(0, 7), whole = state.dFrom.endsWith('-01') && state.dTo === monthEnd(b);
+    const rangeText = whole ? (a === b ? bucketTitle.month(a) : `${bucketTitle.month(a)} to ${bucketTitle.month(b)}`) : `${niceDay(state.dFrom)} to ${niceDay(state.dTo)}`;
+    el.innerHTML = `
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <div><h1>Maestro <span class="hl">Insights</span></h1><p class="sub" style="margin:0">What is off budget and worth a look, and where the month in progress is heading. The figures behind every line are on the <a href="#dashboard">Marketing Dashboard</a>.</p></div>
+        <div class="row"><label>From <select id="a-from">${opts(a)}</select></label><label>To <select id="a-to">${opts(b)}</select></label></div>
+      </div>
+      ${attentionCard(rangeText)}
+      ${paceCard()}`;
+    $('#a-from').onchange = (e) => setRange(monthStart(e.target.value), e.target.value > b ? monthEnd(e.target.value) : state.dTo);
+    $('#a-to').onchange = (e) => setRange(e.target.value < a ? monthStart(e.target.value) : state.dFrom, monthEnd(e.target.value));
+    $$('tr[data-pace]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.pace; state.paceOpen.has(k) ? state.paceOpen.delete(k) : state.paceOpen.add(k); draw(); }));
+    if ($('#attn-more')) $('#attn-more').onclick = () => { state.attnAll = !state.attnAll; draw(); };
+    // a line opens the dashboard for that brand or market location
+    $$('[data-go-brand], [data-go-loc]', el).forEach((r) => (r.onclick = () => { if (r.dataset.goBrand) { state.brand = r.dataset.goBrand; state.location = ''; } else state.location = r.dataset.goLoc; fillFilters(); location.hash = '#dashboard'; }));
+  };
+  draw();
+}
+
+async function insights(el) {
+  const closedMonths = yearMonths().filter(closed);
+  if (!closedMonths.length) { el.innerHTML = `<h1>Marketing <span class="hl">Dashboard</span> · ${state.year}</h1><div class="card">No months of ${state.year} are closed yet, so there are no actuals or outcomes to analyse. The dashboard fills in as actuals arrive; budgets and forecasts for ${state.year} are on the Budget Manager screen. <button class="primary" id="back-year" style="margin-left:8px">Show ${meta.closedThrough.slice(0, 4)}</button></div>`; $('#back-year').onclick = () => { state.year = meta.closedThrough.slice(0, 4); $('#f-year').value = state.year; render(); }; return; }
+  if (state.rangeYear !== state.year || !state.dFrom) { state.rangeYear = state.year; state.dFrom = monthStart(closedMonths[0]); state.dTo = monthEnd(closedMonths.at(-1)); state.prevRange = null; }
+  const pyFrom = yearBack(state.dFrom), pyTo = yearBack(state.dTo), hasPy = pyFrom >= meta.months[0] + '-01';
+  const [f, range, series, py, pySeries, recon, pyRange, cmp] = await Promise.all([api('/api/facts?' + scope()), api('/api/range?' + rangeQuery()), api(`/api/series?${rangeQuery()}&grain=${state.grain}&group=channel`),
     hasPy ? api(`/api/totals?${scope()}&from=${pyFrom}&to=${pyTo}&asof=1`) : null,
     hasPy ? api(`/api/series?${scope()}&from=${pyFrom}&to=${pyTo}&asof=1&grain=${state.grain}&group=channel`) : null,
     api(`/api/recon?${scope()}&year=${state.year}`),
     hasPy ? api(`/api/range?${scope()}&from=${pyFrom}&to=${pyTo}&asof=1`) : null,
-    api(`/api/compare?${rangeQuery()}${hasPy ? `&pfrom=${pyFrom}&pto=${pyTo}` : ''}`), api('/api/pacing?' + scope())]);
-  facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo, recon, pyRange, cmp, pace };
+    api(`/api/compare?${rangeQuery()}${hasPy ? `&pfrom=${pyFrom}&pto=${pyTo}` : ''}`)]);
+  facts = f; ins = { range, series, py, pySeries, pyFrom, pyTo, recon, pyRange, cmp };
   if (state.chartMode === 'budget') ins.plan = await api(`/api/projections?${scope()}&year=${state.year}`);
   drawInsights(el);
 }
 function drawInsights(el) {
+  drawTimeFrame();
   const l1 = Object.fromEntries(meta.level1.map((l) => [l.id, l])), ch = Object.fromEntries(meta.channels.map((c) => [c.id, c]));
   const zero = () => ({ actual: 0, budget: 0, leads: 0, appts: 0, sales: 0, bookings: 0 });
   const camps = new Map(facts.campaigns.map((c) => [c.id, { ...c, level1: l1[c.level1_id], channel: ch[l1[c.level1_id].channel_id], t: zero() }]));
@@ -574,7 +644,7 @@ function drawInsights(el) {
   const off = meta.mode === 'real' ? meta.brands.filter((b) => !b.in_ledger && (!state.brand || String(b.id) === state.brand) && rows.some((r) => r.c.brand_id === b.id && r.t.actual)) : [];
   el.innerHTML = `
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
-      <div><h1>Maestro <span class="hl">Insights</span></h1><p class="sub" style="margin:0">Return on marketing spend, on a lead-cohort basis: appointments, sales and bookings count in the period their lead was created, under the lead-created campaign. Spend follows the campaign's connected source.</p></div>
+      <div><h1>Marketing <span class="hl">Dashboard</span></h1><p class="sub" style="margin:0">Return on marketing spend, on a lead-cohort basis: appointments, sales and bookings count in the period their lead was created, under the lead-created campaign. Spend follows the campaign's connected source.</p></div>
       <div class="row">
         <label>Period by <div class="seg"><button data-mode="months" class="${state.dateMode === 'months' ? 'on' : ''}">Month</button><button data-mode="dates" class="${state.dateMode === 'dates' ? 'on' : ''}">Dates</button></div></label>
         ${state.dateMode === 'months'
@@ -586,7 +656,6 @@ function drawInsights(el) {
     ${un.leads ? `<div class="banner">${int(un.leads)} leads and ${money(un.bookings)} of bookings in this period sit under CRM campaign names that are not mapped yet. <a href="#mappings">Review mappings</a></div>` : ''}
     ${feedSpend ? `<div class="banner" style="background:var(--wash);border-color:#cfe0f5">${compact(feedLinked)} of ${compact(feedSpend)} ad-platform spend (${pct(feedLinked / feedSpend)}) is linked to a CRM campaign, so those campaigns show their own CPL, CPA and MCOB. The rest meets its outcomes at Level 1 only. <a href="#mappings" id="go-links">Review spend links</a></div>` : ''}
     ${off.length ? `<div class="banner">${off.map((b) => esc(b.name)).join(', ')} ${off.length > 1 ? 'are' : 'is'} not in any loaded ledger. ${off.length > 1 ? 'Their' : 'Its'} spend here is ad-platform feeds only, so anything bought outside those platforms is missing.</div>` : ''}
-    ${attentionCard(rangeText)}
     <div class="tiles k5">${tiles.map(([m, val, d]) => `<div class="tile kpi"><div class="kpi-top"><span class="k">${KPIS[m].name}<span class="help" title="${esc(KPIS[m].help)}">?</span></span><button class="zoom" data-zoom="${m}" title="Break ${KPIS[m].name} down by brand, market location, service offering and customer type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Zoom</button></div><div class="v">${val}</div><div class="d">${d}</div>${py[m]}${spark(m)}</div>`).join('')}</div>
     ${cohortNote}
     ${ins.py ? `<p class="sub" style="margin:-6px 0 14px">VS. PY compares with ${niceDay(ins.pyFrom)} to ${niceDay(ins.pyTo)}${meta.pyCutoff ? `, counting only the appointments booked and sales closed by ${niceDay(meta.pyCutoff)} so both years are at the same stage` : ''}. Brands that joined part-way through that period have only part of it to compare against, and spend then came from the ledger alone.</p>` : ''}
@@ -600,7 +669,6 @@ function drawInsights(el) {
       <div class="legend">${meta.channels.map((c, i) => `<button class="lg${state.hiddenCh.has(c.id) ? ' off' : ''}" data-lg="${c.id}" aria-pressed="${!state.hiddenCh.has(c.id)}" title="Click to hide or show ${esc(c.name)}; double-click to break it down by Level 1"><i style="background:${COLORS[i]}"></i>${esc(c.name)}</button>`).join('')}${state.hiddenCh.size ? '<button class="lg" id="lg-all">Show all</button>' : ''}${state.chartMode === 'budget' ? '<span class="lg-py"><i></i>Budget</span>' : ins.pySeries && (state.grain !== 'day' || state.chartMode === 'py') ? '<span class="lg-py"><i></i>Same period last year</span>' : ''}</div>
       <div class="chart" id="chart"></div>${dayNote}
     </div>
-    ${paceCard()}
     ${reconCard()}
     <div class="card"><div class="row" style="justify-content:space-between"><h2>${byBrand ? 'Brand and market location performance' : 'Channel and Level 1 performance'}</h2>
       <div class="row"><span class="ctl-l">Rows by</span><div class="seg upper"><button data-perfby="channel" class="${byBrand ? '' : 'on'}">Channel</button><button data-perfby="brand" class="${byBrand ? 'on' : ''}" title="Brands side by side, opening to market locations and their channels">Brand</button></div><span class="ctl-l" style="margin-left:10px">Variance vs</span><div class="seg upper">${[['budget', 'Budget'], ['plan', 'Projection'], ['py', 'Prior year']].map(([k, n]) => `<button data-vs="${k}" class="${vs === k ? 'on' : ''}">${n}</button>`).join('')}</div><button id="perf-export" title="Every channel, Level 1 and campaign row for this period, as a CSV file that opens in Excel">Export CSV</button></div></div>
@@ -650,9 +718,6 @@ function drawInsights(el) {
   $$('[data-zoom]', el).forEach((b) => (b.onclick = () => openZoom(b.dataset.zoom)));
   $('#perf-export', el).onclick = exportTable;
   $$('[data-perfby]', el).forEach((b) => (b.onclick = () => { state.perfBy = b.dataset.perfby; drawInsights(el); }));
-  $$('tr[data-pace]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.pace; state.paceOpen.has(k) ? state.paceOpen.delete(k) : state.paceOpen.add(k); drawInsights(el); }));
-  if ($('#attn-more')) $('#attn-more').onclick = () => { state.attnAll = !state.attnAll; drawInsights(el); };
-  $$('[data-go-brand], [data-go-loc]', el).forEach((r) => (r.onclick = () => { if (r.dataset.goBrand) { state.brand = r.dataset.goBrand; state.location = ''; } else state.location = r.dataset.goLoc; fillFilters(); render(); }));
   $$('[data-psort]', el).forEach((th) => (th.onclick = () => { state.perfSort = nextSort(state.perfSort, th.dataset.psort, true); drawInsights(el); }));
   $$('tr[data-key]', el).forEach((r) => (r.onclick = () => { const k = r.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); drawInsights(el); }));
 }
@@ -692,7 +757,7 @@ async function openDrill(path) {
     stackedChart($('#d-chart', dlg), { buckets: data.buckets, series: chart, fmt, line: state.grain === 'day', label: bucketLabel[state.grain], title: bucketTitle[state.grain], hint: byCampaign ? '' : 'Double-click a colour to see its campaigns',
       onSeries: byCampaign ? null : (id) => id !== 'other' && openDrill([...path, { group: 'campaign', id, name: l1[id] }]) });
     $('#d-close', dlg).onclick = () => dlg.close();
-    $$('[data-dmeasure]', dlg).forEach((b) => (b.onclick = () => { state.measure = b.dataset.dmeasure; draw(); if (location.hash.slice(1) === 'insights' || !location.hash) drawInsights($('#view')); }));
+    $$('[data-dmeasure]', dlg).forEach((b) => (b.onclick = () => { state.measure = b.dataset.dmeasure; draw(); if (location.hash.slice(1) === 'dashboard' || !location.hash) drawInsights($('#view')); }));
     $$('[data-crumb]', dlg).forEach((b) => (b.onclick = () => openDrill(path.slice(0, Number(b.dataset.crumb) + 1))));
     $$('[data-drill]', dlg).forEach((b) => (b.ondblclick = () => openDrill([...path, { group: 'campaign', id: Number(b.dataset.drill), name: l1[b.dataset.drill] }])));
   };
@@ -1243,9 +1308,10 @@ async function imports(el) {
   }));
 }
 
-const VIEWS = { insights, projections, campaigns, mappings, import: imports };
+const VIEWS = { dashboard: insights, insights: attentionView, projections, campaigns, mappings, import: imports };
 async function render() {
-  const name = VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : 'insights';
+  const name = VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : 'dashboard';
+  drawTimeFrame();
   $$('#nav a').forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#' + name));
   try { await VIEWS[name]($('#view')); } catch (e) { $('#view').innerHTML = `<div class="card">Could not load this screen: ${esc(e.message)}</div>`; }
 }
